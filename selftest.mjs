@@ -602,7 +602,127 @@ console.log("\n【13】登录流程（假 WorkOS 上游）");
   check("poll 缺 device_code 时报错", !p3.ok, JSON.stringify(p3));
   check("poll 不泄露上游错误细节为成功", p3.status !== "success");
 
+  // 运行时账号可以被移除（与环境变量账号相反：后者只能停用）
+  const h2 = await (await w2.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  const rtId = h2.account_details[0].id;
+  const rm = await (await call("/v1/accounts/action", { action: "remove", id: rtId })).json();
+  check("运行时账号可以移除", rm.ok === true && rm.removed === 1,
+    JSON.stringify(rm).slice(0, 160));
+  const h3 = await (await w2.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  check("移除后账号池里不再有该账号", h3.account_count === 0,
+    "account_count=" + h3.account_count);
+
   fake.close();
+}
+
+// =====================================================================
+console.log("\n【14】账号控制（启用/停用/重置冷却/移除）");
+{
+  // 独立加载一份 worker，避免影响前面的用例（账号池是模块级状态）
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "acct-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa\nTOKEN_B_bbbbbbbbbb" };
+  const call = (path, body) => w.fetch(new Request("https://x.dev" + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
+    body: JSON.stringify(body || {}),
+  }), env);
+  const health = async () => (await w.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  const chat = () => w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+
+  let h = await health();
+  check("health 的账号明细含 id / enabled / stats",
+    h.account_details.every((a) => typeof a.id === "string" && a.id.length > 0 &&
+      typeof a.enabled === "boolean" && a.stats && typeof a.stats.ok === "number"),
+    JSON.stringify(h.account_details[0]));
+  check("账号 id 不泄露 token 内容",
+    !JSON.stringify(h).includes("TOKEN_A") && !JSON.stringify(h).includes("TOKEN_B"));
+  const idA = h.account_details[0].id, idB = h.account_details[1].id;
+  check("多账号的 id 互不相同", idA !== idB, idA + " vs " + idB);
+
+  // 未鉴权不得操作账号
+  const noAuth = await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "disable", id: idA }),
+  }), env);
+  check("账号控制端点未鉴权时拒绝", noAuth.status === 401, "status=" + noAuth.status);
+
+  // 停用
+  let r = await (await call("/v1/accounts/action", { action: "disable", id: idA })).json();
+  check("停用账号返回成功", r.ok === true, JSON.stringify(r).slice(0, 140));
+  check("停用后该账号 enabled=false",
+    r.accounts[0].enabled === false && r.accounts[0].available === false,
+    JSON.stringify(r.accounts[0]));
+  check("停用只影响目标账号", r.accounts[1].enabled === true);
+  check("停用后 accounts_available 少一个", r.accounts.filter((a) => a.available).length === 1);
+
+  h = await health();
+  check("health 反映停用状态",
+    h.account_details[0].enabled === false && h.accounts_available === 1,
+    JSON.stringify({ enabled: h.account_details[0].enabled, avail: h.accounts_available }));
+
+  // 停用全部 → 请求应给出明确原因，而不是含糊的报错
+  await call("/v1/accounts/action", { action: "disable", id: idB });
+  const chatResp = await chat();
+  const chatBody = await chatResp.json();
+  check("全部停用时聊天端点说明原因（all_accounts_disabled）",
+    chatBody.error && chatBody.error.reason === "all_accounts_disabled",
+    JSON.stringify(chatBody).slice(0, 200));
+  check("全部停用返回 429（可重试语义而非 500）", chatResp.status === 429, "status=" + chatResp.status);
+
+  // 启用回来 → 恢复正常
+  r = await (await call("/v1/accounts/action", { action: "enableAll" })).json();
+  check("全部启用后所有账号 enabled",
+    r.accounts.every((a) => a.enabled === true), JSON.stringify(r.accounts.map((a) => a.enabled)));
+  check("全部启用后 accounts_available 恢复", r.accounts.filter((a) => a.available).length === 2);
+
+  // 重置冷却
+  r = await (await call("/v1/accounts/action", { action: "reset", id: idA })).json();
+  check("重置冷却返回成功且该账号可用",
+    r.ok === true && r.accounts.find((a) => a.id === idA).cooldown_seconds === 0,
+    JSON.stringify(r.accounts.find((a) => a.id === idA)));
+
+  r = await (await call("/v1/accounts/action", { action: "resetAll" })).json();
+  check("重置全部冷却返回成功", r.ok === true, JSON.stringify(r).slice(0, 140));
+
+  // 环境变量账号不可移除（移除没意义：下次 parseAccounts 又会建出来）
+  const rm = await call("/v1/accounts/action", { action: "remove", id: idA });
+  const rmBody = await rm.json();
+  check("环境变量账号拒绝移除", rm.status === 400 && !rmBody.ok, JSON.stringify(rmBody).slice(0, 200));
+  check("拒绝移除时提示改用停用", rmBody.error && rmBody.error.message.includes("停用"));
+
+  // 未知 id / 未知 action
+  const unknown = await (await call("/v1/accounts/action", { action: "disable", id: "deadbeef" })).json();
+  check("未知账号 id 返回错误", unknown.ok !== true, JSON.stringify(unknown).slice(0, 140));
+  const badAct = await (await call("/v1/accounts/action", { action: "nonsense", id: idA })).json();
+  check("未知 action 返回错误", badAct.ok !== true, JSON.stringify(badAct).slice(0, 140));
+  const noAct = await (await call("/v1/accounts/action", {})).json();
+  check("缺少 action 参数时报错", noAct.ok !== true);
+
+  // 统计：成功调用应累计到账号上
+  await chat();
+  h = await health();
+  check("成功请求累加到账号统计（ok>0）",
+    h.account_details.some((a) => a.stats.ok > 0),
+    JSON.stringify(h.account_details.map((a) => a.stats)));
+
+  // token 刷新轮换后，账号 id 必须保持不变，否则控制台的开关会跟丢账号
+  const afterRefresh = await health();
+  check("账号 id 在 token 轮换后保持稳定",
+    afterRefresh.account_details[0].id === idA,
+    "before=" + idA + " after=" + afterRefresh.account_details[0].id);
 }
 
 // ---------- 收尾 ----------

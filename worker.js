@@ -42,6 +42,10 @@ const WORKOS_CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR";
 // CLINE_REFRESH_TOKEN 环境变量可包含多行，每行一个 refreshToken，
 // 额度用尽(空响应)时自动轮换下一个账号。
 // 结构：{ refreshToken, accessToken, expiry, cooldownUntil }
+// 另有三个控制台用的字段：
+//   id      前端用来标识账号（token 的短哈希，不可逆，不泄露 token）
+//   enabled 是否参与轮询；停用后跳过但不从池里移除（环境变量账号只能这样"下线"）
+//   stats   成功/失败计数与最后一次错误，供控制台展示
 let accounts = [];
 // 运行时通过控制台登录追加的账号。只存在当前实例内存里，**重启或部署后消失**，
 // 因此登录成功后必须把 refreshToken 存进部署环境变量才算真正落地。
@@ -224,7 +228,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "2.0.3";
+const VERSION = "2.1.0";
 
 // ===== 入口 =====
 // Cloudflare Workers 入口。Vercel 入口由 build-vercel.mjs 依据下面的
@@ -252,29 +256,20 @@ async function handleRequest(request, env) {
   // 健康诊断端点（无需鉴权，用于排查环境变量是否生效）
   // 字段同时提供 README 用的 api_key_configured/account_count 与旧名 authenticated/accounts
   if (request.method === "GET" && (path === "/v1/health" || path === "/health")) {
-    const pool = parseAccounts(env);
+    const summaries = accountSummaries(env);
     const now = Date.now();
     const keyConfigured = !!(env.API_KEY && env.API_KEY.trim());
     return jsonResponse({
       ok: true,
       version: VERSION,
       api_key_configured: keyConfigured,
-      account_count: pool.length,
+      account_count: summaries.length,
       // 兼容旧字段名（README 早期版本用的是这两个）
       authenticated: keyConfigured,
-      accounts: pool.length,
-      accounts_available: pool.filter((a) => !a.cooldownUntil || a.cooldownUntil <= now).length,
+      accounts: summaries.length,
+      accounts_available: summaries.filter((a) => a.available).length,
       // 每个账号的状态明细，供控制台展示账号池（不含任何 token 内容）
-      account_details: pool.map((a, i) => ({
-        index: i,
-        available: !a.cooldownUntil || a.cooldownUntil <= now,
-        cooldown_seconds: a.cooldownUntil > now ? Math.ceil((a.cooldownUntil - now) / 1000) : 0,
-        cooldown_reason: a.cooldownReason || null,
-        token_cached: !!(a.accessToken && now < a.expiry),
-        // 运行时登录的账号在重启后会消失，控制台需要据此提示用户去存环境变量
-        runtime: !!a.runtime,
-        email: a.email || "",
-      })),
+      account_details: summaries,
       runtime_accounts: accounts && accounts.filter((a) => a.runtime).length || 0,
       model: DEFAULT_MODEL,
       models_cached: modelsCache ? modelsCache.length : 0,
@@ -302,6 +297,8 @@ async function handleRequest(request, env) {
   if (request.method === "POST") {
     if (path === "/v1/login/start") return handleLoginStart(request, env);
     if (path === "/v1/login/poll") return handleLoginPoll(request, env);
+    // 账号控制（启用/停用/重置冷却/移除），同样必须鉴权
+    if (path === "/v1/accounts/action") return handleAccountAction(request, env);
   }
 
   // POST 聊天端点
@@ -386,6 +383,179 @@ function parseAccounts(env) {
   return accounts;
 }
 
+// ---------------------------------------------------------------------------
+// 账号控制（控制台用）
+//
+// 三种控制能力，都只作用于当前实例内存（重启即恢复环境变量原状）：
+//   enabled=false  停用：跳过轮询但保留在池里，随时可再启用
+//   reset          清冷却与 token 缓存，让它立刻可以被再次尝试
+//   remove         移除运行时登录的账号。环境变量账号只能停用 —— 移除没有意义，
+//                  下次 parseAccounts 会照环境变量把它重建出来。
+//
+// 账号 id 取 originToken 的短哈希：既稳定标识账号，又不泄露 token 内容。
+// 用 originToken 而非 refreshToken，是因为上游刷新时会轮换 refreshToken，
+// 若用后者，账号每刷新一次 id 就变，控制台的开关会"跟丢"账号。
+// ---------------------------------------------------------------------------
+let disabledIds = new Set();
+
+function accountId(acct) {
+  const src = acct.originToken || acct.refreshToken || "";
+  // FNV-1a 32 位：够短、无依赖。仅用于标识，不承担安全职责。
+  let h = 0x811c9dc5;
+  for (let i = 0; i < src.length; i++) {
+    h ^= src.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+// 解析并为每个账号补上 id / enabled（含已停用的账号，供控制台展示）
+function listAccounts(env) {
+  const pool = parseAccounts(env);
+  for (const a of pool) {
+    if (!a.id) a.id = accountId(a);
+    a.enabled = !disabledIds.has(a.id);
+  }
+  return pool;
+}
+
+// 可参与轮询的账号。停用的一律跳过 —— 这是"停用"唯一的实际作用点。
+function activeAccounts(env) {
+  return listAccounts(env).filter((a) => a.enabled);
+}
+
+// 账号池的对外视图。控制台与 /v1/health 共用，避免两处字段定义漂移。
+// 绝不包含 refreshToken / accessToken 内容。
+function accountSummaries(env) {
+  const now = Date.now();
+  return listAccounts(env).map((a, i) => ({
+    index: i,
+    id: a.id,
+    enabled: a.enabled,
+    // 停用的账号不算"可用"：它不会参与轮询，界面上也不该显示成可用
+    available: a.enabled && (!a.cooldownUntil || a.cooldownUntil <= now),
+    cooldown_seconds: a.cooldownUntil > now ? Math.ceil((a.cooldownUntil - now) / 1000) : 0,
+    cooldown_reason: a.cooldownReason || null,
+    token_cached: !!(a.accessToken && now < a.expiry),
+    // 运行时登录的账号在重启后会消失，控制台需要据此提示用户去存环境变量
+    runtime: !!a.runtime,
+    email: a.email || "",
+    stats: {
+      ok: a.okCount || 0,
+      fail: a.failCount || 0,
+      last_error: a.lastError || null,
+      last_error_at: a.lastErrorAt || 0,
+      last_used_at: a.lastUsedAt || 0,
+    },
+  }));
+}
+
+// 记一次账号使用结果。只做统计展示，不影响调度决策。
+function markAccountResult(err) {
+  const acc = currentAccount;
+  if (!acc) return;
+  if (err) {
+    acc.failCount = (acc.failCount || 0) + 1;
+    acc.lastError = String(err).slice(0, 160);
+    acc.lastErrorAt = Date.now();
+  } else {
+    acc.okCount = (acc.okCount || 0) + 1;
+    acc.lastError = null;
+    acc.lastUsedAt = Date.now();
+  }
+}
+
+// 账号管理动作。返回给前端的是**动作执行后的完整账号列表**，
+// 这样前端一次请求就能刷新界面，不用再补一次 /v1/health。
+async function handleAccountAction(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+
+  let body;
+  try {
+    body = await request.json();
+  } catch (e) {
+    return jsonResponse({ error: { message: "Invalid JSON body", type: "parse_error" } }, 400);
+  }
+
+  const action = String(body.action || "").trim();
+  const id = String(body.id || "").trim();
+  const respond = (extra) =>
+    jsonResponse({ ok: true, action, accounts: accountSummaries(env), ...extra }, 200);
+
+  // 批量动作
+  if (action === "enableAll") {
+    disabledIds.clear();
+    return respond({ message: "已启用全部账号" });
+  }
+  if (action === "resetAll") {
+    const now = Date.now();
+    let n = 0;
+    for (const a of listAccounts(env)) {
+      if (a.cooldownUntil > now) n++;
+      a.cooldownUntil = 0;
+      a.cooldownReason = null;
+      a.accessToken = null;
+      a.expiry = 0;
+    }
+    return respond({ message: `已重置 ${n} 个冷却中的账号` });
+  }
+
+  if (!action) {
+    return jsonResponse({ error: { message: "缺少 action 参数", type: "account_error" } }, 400);
+  }
+
+  const target = listAccounts(env).find((a) => a.id === id);
+  if (!target) {
+    // 找不到通常是控制台拿的是旧列表（账号刚被移除），提示刷新即可
+    return jsonResponse({
+      error: { message: "找不到该账号，可能已被移除。请点「刷新」重新读取账号池。", type: "account_error" },
+    }, 404);
+  }
+
+  if (action === "disable") {
+    disabledIds.add(target.id);
+    // 停用当前正在用的账号时立刻让位，否则它会一直用到下次挑号
+    if (currentAccount === target) currentAccount = null;
+    return respond({ message: "已停用，该账号将不再参与轮询" });
+  }
+
+  if (action === "enable") {
+    disabledIds.delete(target.id);
+    return respond({ message: "已启用，该账号将重新参与轮询" });
+  }
+
+  if (action === "reset") {
+    target.cooldownUntil = 0;
+    target.cooldownReason = null;
+    target.accessToken = null;
+    target.expiry = 0;
+    return respond({ message: "已清除冷却，下次请求即可使用该账号" });
+  }
+
+  if (action === "remove") {
+    if (!target.runtime) {
+      return jsonResponse({
+        error: {
+          message: "环境变量里的账号无法移除。它是从 CLINE_REFRESH_TOKEN 读出来的，"
+                 + "移掉下一次读取又会出现。要让它不再被使用，请改用「停用」；"
+                 + "要永久删除，请编辑部署环境的 CLINE_REFRESH_TOKEN 并重新部署。",
+          type: "account_error",
+        },
+      }, 400);
+    }
+    // 运行时账号按 originToken 匹配（上游轮换过 refreshToken 也认得出来）
+    const before = dynamicAccounts.length;
+    dynamicAccounts = dynamicAccounts.filter((d) => d.refreshToken !== target.originToken);
+    accountPoolDirty = true;
+    disabledIds.delete(target.id);
+    if (currentAccount === target) currentAccount = null;
+    return respond({ removed: before - dynamicAccounts.length, message: "已移除该临时账号" });
+  }
+
+  return jsonResponse({ error: { message: "未知的 action: " + action, type: "account_error" } }, 400);
+}
+
 // 取得当前账号的 accessToken（独立缓存，失效/冷却则刷新）
 async function getAccountToken(account) {
   const now = Date.now();
@@ -418,6 +588,12 @@ async function getAccountToken(account) {
     throw new Error("refresh_no_token");
   }
   account.accessToken = accessToken;
+  // 顺带采集邮箱：环境变量里的账号本来没有邮箱可显示，而刷新响应带 userInfo.email。
+  // 只在缺失时写一次，避免每个刷新周期都覆盖。
+  if (!account.email) {
+    const em = data?.data?.userInfo?.email;
+    if (typeof em === "string" && em.trim()) account.email = em.trim();
+  }
   // Cline 会在刷新时轮换 refreshToken；必须保存新 token，避免下一次刷新 invalid_grant。
   if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {
     account.refreshToken = data.data.refreshToken.trim();
@@ -457,8 +633,15 @@ function pickAccount(pool) {
 }
 
 async function getAccessToken(env) {
-  const pool = parseAccounts(env);
+  const pool = activeAccounts(env); // 已停用的账号不参与轮询
   if (pool.length === 0) {
+    const all = listAccounts(env);
+    if (all.length > 0) {
+      // 有账号但全被停用：这是用户的主动选择，报错要说清原因，否则会被当成配置缺失
+      const err = new Error("all_accounts_disabled");
+      err.accountCount = all.length;
+      throw err;
+    }
     throw new Error("缺少 CLINE_REFRESH_TOKEN 环境变量");
   }
   const now = Date.now();
@@ -600,6 +783,9 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
     //    导致流式请求的首字节要等到模型全部生成完才到达客户端（实测 TTFT≈总耗时），
     //    流式退化成"假流式"。限流/错误判定只需在非 2xx 时读 body（体量很小）。
     if (resp.ok) {
+      // 只统计"上游接受了这次请求"。流式响应此刻还没读完，但它已成功建连，
+      // 用来判断账号是否还能用足够了 —— 这也是唯一不破坏流式透传的埋点位置。
+      markAccountResult(null);
       return resp;
     }
 
@@ -621,10 +807,11 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
         currentAccount.cooldownReason = "limit";
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
+        markAccountResult("HTTP " + resp.status + " 额度/限流");
         console.log(`[account-switch] 账号额度/限流，冷却 ${Math.round(cooldownMs / 1000)}s，切换到下一个`);
       }
       // 还有可用账号 → 短退避后重试（会切到下一个号）
-      const pool = parseAccounts(env);
+      const pool = activeAccounts(env);
       const hasOther = pool.some((a) => !a.cooldownUntil || a.cooldownUntil <= Date.now());
       if (!hasOther) {
         console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
@@ -635,6 +822,7 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
     }
 
     // 其他错误（403/400/401 等）不重试，直接返回
+    markAccountResult("HTTP " + resp.status);
     return resp;
   }
   // 重试次数用完，返回最后一次响应
@@ -1661,19 +1849,140 @@ details.rz pre{
 @keyframes blink { 50%{ opacity:0; } }
 
 /* ══ 账号 ══ */
-.accts{ display:grid; grid-template-columns:repeat(auto-fill,minmax(216px,1fr)); gap:12px; }
-.acct{ background:var(--surface-2); border:2px solid var(--line); padding:11px 12px; box-shadow:var(--shadow-sm); }
-.acct.live{ border-color:var(--ok); } .acct.cool{ border-color:var(--warn); }
-.acct .top{ display:flex; align-items:center; gap:8px; margin-bottom:7px; }
-.acct .ix{ width:22px; height:22px; display:grid; place-items:center; font-size:10.5px; font-weight:700; border:2px solid var(--line); color:var(--ink-3); }
+/* 概览条：进页面先看到几个账号、几个能用、几个被停用 */
+.acctbar{
+  display:flex; align-items:center; gap:16px; flex-wrap:wrap;
+  padding:10px 12px; margin-bottom:12px;
+  background:var(--surface-2); border:2px solid var(--line);
+}
+.acctbar .stat{ display:flex; align-items:baseline; gap:6px; }
+.acctbar .stat .n{ font-size:19px; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+.acctbar .stat .l{ font-size:10.5px; color:var(--ink-3); }
+.acctbar .stat.ok .n{ color:var(--ok); }
+.acctbar .stat.warn .n{ color:var(--warn); }
+.acctbar .stat.bad .n{ color:var(--bad); }
+.acctbar .stat.off .n{ color:var(--ink-3); }
+.acctbar .spacer{ flex:1; }
+
+/* 账号卡片：身份 / 数据 / 错误 / 动作 四层纵向结构 */
+.accts{ display:grid; grid-template-columns:repeat(auto-fill,minmax(268px,1fr)); gap:12px; }
+.acct{
+  background:var(--surface-2); border:2px solid var(--line);
+  display:flex; flex-direction:column; box-shadow:var(--shadow-sm);
+}
+.acct.live{ border-color:var(--ok); }
+.acct.cool{ border-color:var(--warn); }
+.acct.off{ border-color:var(--line); }
+.acct.off .hd .who .ml{ color:var(--ink-3); }
+
+.acct .hd{ display:flex; align-items:center; gap:8px; padding:9px 12px; border-bottom:1px solid var(--line-soft); }
+.acct .ix{
+  width:22px; height:22px; flex:none; display:grid; place-items:center;
+  font-size:10.5px; font-weight:700; border:2px solid var(--line); color:var(--ink-3);
+  font-variant-numeric:tabular-nums;
+}
 .acct.live .ix{ border-color:var(--ok); color:var(--ok); }
 .acct.cool .ix{ border-color:var(--warn); color:var(--warn); }
-.acct .ml{ font-size:11.5px; color:var(--ink-2); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.acct .st{ font-size:11px; }
-.acct.live .st{ color:var(--ok); } .acct.cool .st{ color:var(--warn); }
-.acct dl{ margin-top:8px; padding-top:8px; border-top:1px solid var(--line-soft); display:grid; gap:3px; }
-.acct dl div{ display:flex; justify-content:space-between; gap:8px; font-size:10.5px; }
-.acct dl .k{ color:var(--ink-3); } .acct dl .v{ color:var(--ink-2); font-variant-numeric:tabular-nums; }
+.acct .who{ min-width:0; flex:1; }
+.acct .who .ml{
+  display:block; font-size:11.5px; color:var(--ink);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.acct .who .src{ display:block; font-size:10px; color:var(--ink-3); margin-top:1px; }
+.acct .who .src b{ color:var(--accent); font-weight:400; }
+
+.acct .badge{
+  flex:none; padding:2px 7px; font-size:10px; font-weight:700; letter-spacing:.03em;
+  border:2px solid; white-space:nowrap;
+}
+.badge.live{ border-color:var(--ok); color:var(--ok); background:var(--ok-soft); }
+.badge.cool{ border-color:var(--warn); color:var(--warn); background:var(--warn-soft); }
+.badge.off{ border-color:var(--line); color:var(--ink-3); background:var(--inset); }
+
+/* 数据区：双列小格 */
+.acct .kv{ display:grid; grid-template-columns:1fr 1fr; flex:1; align-content:start; }
+.acct .kv > div{
+  padding:6px 12px; border-bottom:1px solid var(--line-soft);
+  display:flex; flex-direction:column; gap:1px; min-width:0;
+}
+.acct .kv > div:nth-child(odd){ border-right:1px solid var(--line-soft); }
+.acct .kv .k{ font-size:9.5px; color:var(--ink-3); letter-spacing:.03em; }
+.acct .kv .v{ font-size:11.5px; color:var(--ink-2); font-variant-numeric:tabular-nums; }
+.acct .kv .v.ok{ color:var(--ok); }
+.acct .kv .v.warn{ color:var(--warn); }
+.acct .kv .v.bad{ color:var(--bad); }
+.acct .kv .v.dim{ color:var(--ink-3); }
+
+/* 最后一次错误：整行铺开，超长省略，悬浮看全文 */
+.acct .last{
+  padding:6px 12px; border-bottom:1px solid var(--line-soft); font-size:10.5px;
+  color:var(--bad); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.acct .last .k{ color:var(--ink-3); margin-right:5px; }
+
+.acct .act{ display:flex; gap:6px; padding:9px 12px; flex-wrap:wrap; align-items:center; }
+
+/* ══ 右下角通知 ══
+   fixed 右下角，多条向上堆叠。几秒后自动消失（时长按类型区分，见 JS 里的
+   TOAST_MS），也可手动关闭。 */
+#toasts{
+  position:fixed; right:16px; bottom:16px; z-index:400;
+  display:flex; flex-direction:column-reverse; gap:10px;
+  max-width:min(430px,calc(100vw - 32px));
+  pointer-events:none;
+}
+.toast{
+  pointer-events:auto; position:relative; overflow:hidden;
+  background:var(--surface); border:2px solid var(--line); border-left-width:5px;
+  box-shadow:var(--shadow-lg); padding:11px 12px;
+  display:flex; gap:9px; align-items:flex-start;
+  animation:toast-in .22s cubic-bezier(.2,.9,.3,1.2);
+}
+@keyframes toast-in{ from{ opacity:0; transform:translate(16px,10px); } to{ opacity:1; transform:none; } }
+/* 关闭：先滑出再移除，避免元素瞬间消失显得突兀 */
+.toast.out{ animation:toast-out .18s ease-in forwards; }
+@keyframes toast-out{ to{ opacity:0; transform:translate(16px,8px); } }
+
+.toast.err{ border-color:var(--bad); border-left-color:var(--bad); }
+.toast.ok{ border-color:var(--ok); border-left-color:var(--ok); }
+.toast.warn{ border-color:var(--warn); border-left-color:var(--warn); }
+.toast.info{ border-color:var(--accent); border-left-color:var(--accent); }
+.toast .ic{ flex:none; font-size:13px; line-height:1.3; font-weight:700; }
+.toast.err .ic{ color:var(--bad); }
+.toast.ok .ic{ color:var(--ok); }
+.toast.warn .ic{ color:var(--warn); }
+.toast.info .ic{ color:var(--accent); }
+.toast .bd{ min-width:0; flex:1; }
+.toast .ti{ font-size:11.5px; font-weight:700; margin-bottom:3px; }
+.toast.err .ti{ color:var(--bad); }
+.toast.ok .ti{ color:var(--ok); }
+.toast.warn .ti{ color:var(--warn); }
+.toast.info .ti{ color:var(--accent); }
+.toast .ms{
+  font-size:11.5px; color:var(--ink-2); line-height:1.55;
+  word-break:break-word; max-height:5.4em; overflow:auto;
+}
+.toast .ms code{
+  font-size:11px; background:var(--inset); border:1px solid var(--line-soft);
+  padding:0 4px; word-break:break-all;
+}
+.toast .x{
+  flex:none; width:20px; height:20px; padding:0; display:grid; place-items:center;
+  font-size:13px; line-height:1; background:transparent; border:2px solid var(--line);
+  color:var(--ink-3); box-shadow:none; cursor:pointer;
+}
+.toast .x:hover{ border-color:var(--accent); color:var(--accent); }
+.toast .x:active{ transform:none; box-shadow:none; }
+/* 剩余时间条：直观显示还有多久自动关闭；悬停暂停（正在读时不该被收走） */
+.toast .bar{ height:2px; background:var(--line-soft); margin-top:8px; overflow:hidden; }
+.toast .bar i{ display:block; height:100%; width:100%; transform-origin:left; }
+.toast.err .bar i{ background:var(--bad); opacity:.6; }
+.toast.ok .bar i{ background:var(--ok); opacity:.6; }
+.toast.warn .bar i{ background:var(--warn); opacity:.6; }
+.toast.info .bar i{ background:var(--accent); opacity:.6; }
+.toast .bar i.run{ animation:toast-countdown linear forwards; }
+@keyframes toast-countdown{ from{ transform:scaleX(1); } to{ transform:scaleX(0); } }
+.toast:hover .bar i.run{ animation-play-state:paused; }
 
 /* 登录 */
 .login[hidden]{ display:none !important; }
@@ -1913,10 +2222,23 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
           <header>
             <h3>账号池</h3>
             <span class="grow"></span>
+            <button class="xs ghost" id="btnResetAll" title="清除所有账号的冷却状态与 token 缓存">重置全部冷却</button>
+            <button class="xs ghost" id="btnEnableAll" title="启用被停用的账号">全部启用</button>
             <button class="xs ghost" id="btnRefreshAcct">刷新</button>
             <button class="xs primary" id="btnLogin">登录新账号</button>
           </header>
-          <div class="pad"><div class="accts" id="accts"></div><div class="empty" id="acctEmpty" hidden>还没有账号。点右上角「登录新账号」，或把 refreshToken 填进环境变量。</div></div>
+          <div class="pad">
+            <div class="acctbar" id="acctBar">
+              <span class="stat ok"><span class="n" id="acOk">0</span><span class="l">可用</span></span>
+              <span class="stat warn"><span class="n" id="acCool">0</span><span class="l">冷却中</span></span>
+              <span class="stat off"><span class="n" id="acOff">0</span><span class="l">已停用</span></span>
+              <span class="stat"><span class="n" id="acTotal">0</span><span class="l">总数</span></span>
+              <span class="spacer"></span>
+              <span class="note" id="acctHint"></span>
+            </div>
+            <div class="accts" id="accts"></div>
+            <div class="empty" id="acctEmpty" hidden>还没有账号。点右上角「登录新账号」，或把 refreshToken 填进环境变量。</div>
+          </div>
         </div>
 
         <div class="box login" id="loginBox" hidden>
@@ -1931,6 +2253,7 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
               <li>控制台登录得到的 refreshToken 只存在<b>当前实例内存</b>，进程重启或重新部署后消失。</li>
               <li>要长期生效，把 refreshToken 填进部署环境变量 <code>CLINE_REFRESH_TOKEN</code>（多账号一行一个），保存后重新部署。</li>
               <li>登录来的账号会在卡片上标注「临时」，与环境变量里的常驻账号区分。</li>
+              <li><b>停用</b>只影响当前实例的轮询，重启即恢复；环境变量里的账号不能移除（下次读取又会出现），只能用停用让它下线。</li>
             </ul>
           </div>
         </div>
@@ -2050,6 +2373,9 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
   </div>
 </div>
 
+<!-- 右下角通知容器：错误/成功提示在此堆叠（JS 填充） -->
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
+
 <script>
 /* ══════════════════════════════════════════════════════════════════
    cline-free 控制台
@@ -2093,7 +2419,9 @@ var state = {
   stream:true, temp:"", topp:"", sys:"",
   health:null, logs:[], filter:"all", search:"", sort:"region", sortDir:1,
   testing:false, busy:false, abort:null, snip:"curl",
-  login:null, loginTimer:null, follow:true, selId:null
+  login:null, loginTimer:null, follow:true, selId:null,
+  healthDown:false,  // 上次健康检查是否失败（用于去重连接错误提示）
+  acctWarned:false   // 是否已就"账号池不可用"弹过窗（用于去重，避免每 30 秒弹一次）
 };
 
 function save(k,v){ try{ localStorage.setItem(k, typeof v==="string"?v:JSON.stringify(v)); }catch(e){} }
@@ -2153,6 +2481,102 @@ function flash(btn,text){
   clearTimeout(btn._t);
   btn._t=setTimeout(function(){ btn.textContent=btn.getAttribute("data-old")||text; btn.classList.remove("done"); btn.removeAttribute("data-old"); },1300);
 }
+
+/* ══ 右下角通知 ══
+   停留时长按类型区分：报错/警告需要时间读，留久一点；普通提示扫一眼就够，快点收走。
+   右上角有关闭按钮，悬停会暂停倒计时 —— 正在读一条长错误时不会被突然收走。 */
+var TOAST_MS = {
+  err:  30000,   // 报错：30 秒
+  warn: 30000,   // 警告：同报错，都是"需要你处理"的信号
+  ok:    5000,   // 普通提示：5 秒
+  info:  5000
+};
+// 兜底时长：kind 传了没定义的值时用它，而不是变成 0（那样会瞬间消失）
+var TOAST_MS_DEFAULT = 5000;
+// 同时最多几条，超出丢最旧的。定为 3 是为了控制堆叠高度：
+// 通知固定在右下角，堆到四五条时会长高到盖住对话页的输入框右端。
+var TOAST_MAX = 3;
+
+// 取某类通知的停留时长
+function toastDuration(kind){
+  var ms = TOAST_MS[kind];
+  return typeof ms === "number" ? ms : TOAST_MS_DEFAULT;
+}
+
+function dismissToast(el){
+  if(!el || el._closed) return;
+  el._closed = true;
+  clearTimeout(el._timer);
+  // 先播关闭动画，动画结束再移除；动画缺失时（旧浏览器）用定时器兜底
+  el.classList.add("out");
+  var gone = function(){ if(el.parentNode) el.parentNode.removeChild(el); };
+  el.addEventListener("animationend", gone, {once:true});
+  setTimeout(gone, 400);
+}
+
+/**
+ * 右下角冒出一条通知。
+ *   kind: err / ok / warn / info（决定配色与停留时长，见 TOAST_MS）
+ *   title: 加粗标题
+ *   msg:   正文（纯文本，会转义；需要行内代码请自己拼）
+ */
+function toast(kind, title, msg){
+  var box = $("toasts");
+  if(!box) return null;
+  var type = TOAST_MS[kind] ? kind : "info";
+
+  // 只留最近几条：账号页连续点按钮时不该堆满整屏
+  var live = box.querySelectorAll(".toast:not(.out)");
+  for(var i = 0; i < live.length - (TOAST_MAX - 1); i++) dismissToast(live[i]);
+
+  var icons = { err:"!", ok:"✓", warn:"▲", info:"i" };
+  var el = document.createElement("div");
+  el.className = "toast " + type;
+  el.setAttribute("role", type === "err" ? "alert" : "status");
+  el.innerHTML =
+    '<span class="ic">' + (icons[type] || icons.info) + '</span>' +
+    '<div class="bd">' +
+      (title ? '<div class="ti">' + esc(title) + '</div>' : '') +
+      (msg ? '<div class="ms">' + msg + '</div>' : '') +
+      '<div class="bar"><i class="run"></i></div>' +
+    '</div>' +
+    '<button class="x" type="button" title="关闭" aria-label="关闭">×</button>';
+
+  el.querySelector(".x").addEventListener("click", function(){ dismissToast(el); });
+
+  // 进度条动画与自动关闭共用同一时长；悬停时 CSS 暂停动画，
+  // 但定时器不会暂停，所以额外在 mouseenter/leave 上调整剩余时间。
+  var ttl = toastDuration(type);
+  var bar = el.querySelector(".bar i");
+  bar.style.animationDuration = ttl + "ms";
+  var startedAt = Date.now();
+  var remaining = ttl;
+  var arm = function(ms){
+    clearTimeout(el._timer);
+    startedAt = Date.now();
+    el._timer = setTimeout(function(){ dismissToast(el); }, ms);
+  };
+  arm(remaining);
+  el.addEventListener("mouseenter", function(){
+    remaining = Math.max(remaining - (Date.now() - startedAt), 1000);
+    clearTimeout(el._timer);
+  });
+  el.addEventListener("mouseleave", function(){ arm(remaining); });
+
+  box.appendChild(el);
+  return el;
+}
+
+// 把 fetch/异常里的错误对象转成"标题 + 正文"两段，供 toast 使用
+function toastError(prefix, err, detail){
+  var msg = "";
+  if(err && err.error && err.error.message) msg = err.error.message;
+  else if(err && err.message) msg = err.message;
+  else if(typeof err === "string") msg = err;
+  else msg = String(err || "未知错误");
+  if(detail) msg += (msg ? "<br>" : "") + esc(detail);
+  return toast("err", prefix, esc(msg));
+}
 function copyText(text,btn,src){
   if(!text){ flash(btn,"无内容"); return; }
   var ok=function(){ flash(btn,"已复制"); };
@@ -2163,7 +2587,12 @@ function copyText(text,btn,src){
 }
 function explain(status,body){
   var b=String(body||""),low=b.toLowerCase();
-  if(low.indexOf("all_accounts_cooling")>=0) return "所有账号免费额度都在冷却中。等冷却结束，或追加更多账号自动切号。";
+  // 顺序要紧：这两个 reason 都以 429 返回，必须排在通用 429 之前，
+  // 否则"账号被停用/全部冷却"会被误报成"上游额度用尽"，
+  // 把用户引向等冷却，而真正该做的是去账号页启用账号。
+  if(low.indexOf("all_accounts_disabled")>=0) return "账号池里的账号全部处于「停用」状态，没有账号可用。到「账号」页点「全部启用」或逐个启用。";
+  if(low.indexOf("all_accounts_cooling")>=0) return "所有账号免费额度都在冷却中。等冷却结束，或在「账号」页重置冷却、追加更多账号。";
+  if(low.indexOf("missing_refresh_token")>=0) return "服务端没有配置 CLINE_REFRESH_TOKEN。到「账号」页登录一个账号，或把它填进环境变量。";
   if(low.indexOf("server_no_key")>=0) return "服务端没有配置 API_KEY，聊天端点已拒绝请求。";
   if(low.indexOf("missing_client_key")>=0||low.indexOf("wrong_client_key")>=0||status===401) return "API Key 不正确或缺失，到「接入配置」填写。";
   if(status===429) return "被上游限流（429），多为当日免费额度用尽。";
@@ -2203,19 +2632,19 @@ function renderHealth(h){
   if(!total){ cells.innerHTML='<span class="empty">未配置账号</span>'; }
   else{
     cells.innerHTML=det.map(function(a){
-      var cls="cell "+(a.available?"live":"cool")+(a.runtime?" tmp":"");
+      var cls="cell "+(a.available?"live":(a.enabled?"cool":"off"))+(a.runtime?" tmp":"");
       var tip="账号 #"+(a.index+1);
       if(a.email) tip+="（"+a.email+"）";
-      tip+="：" +(a.available?"可用":"冷却中");
-      if(!a.available&&a.cooldown_seconds){
-        tip+="，剩约 "+Math.ceil(a.cooldown_seconds/60)+" 分钟";
+      tip+="：" +(!a.enabled?"已停用":(a.available?"可用":"冷却中"));
+      if(a.enabled&&!a.available&&a.cooldown_seconds){
+        tip+="，剩约 "+fmtDur(a.cooldown_seconds);
         if(a.cooldown_reason==="limit") tip+="（额度用尽）";
         else if(a.cooldown_reason==="empty") tip+="（空响应）";
         else if(a.cooldown_reason==="auth") tip+="（鉴权失败）";
       }
       if(a.runtime) tip+="，登录得到（重启会丢）";
       else if(a.token_cached) tip+="，token 已缓存";
-      var lb=a.available?String(a.index+1):(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!");
+      var lb=!a.enabled?"–":(a.available?String(a.index+1):(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!"));
       return '<span class="'+cls+'" title="'+esc(tip)+'">'+esc(lb)+"</span>";
     }).join("");
   }
@@ -2234,49 +2663,222 @@ function renderHealth(h){
   if(!ok) n+='<div class="note bad"><span class="grow">服务端未配置 <b>API_KEY</b>，聊天端点会拒绝所有请求。</span></div>';
   else if(!state.key) n+='<div class="note info"><span class="grow">还没有访问密钥。本地运行会自动生成并注入。</span><button class="xs ghost" onclick="goConfig()">去填写</button></div>';
   if(total===0) n+='<div class="note bad"><span class="grow">服务端未配置 <b>CLINE_REFRESH_TOKEN</b>，无法调用上游。</span><button class="xs ghost" onclick="goAccounts()">去登录</button></div>';
-  else if(avail===0) n+='<div class="note warn"><span class="grow">当前 0 个账号可用，请求会直接返回 429。</span></div>';
   if(h.runtime_accounts>0) n+='<div class="note warn"><span class="grow">有 '+h.runtime_accounts+' 个登录得到的临时账号，重启后会消失，建议存进环境变量。</span><button class="xs ghost" onclick="goAccounts()">查看</button></div>';
   var box=$("notes");
   box.innerHTML=n;
   box.style.pointerEvents=n?"auto":"none";
+
+  // 账号池不可用时用右下角弹窗提示，不再占用顶部横幅。
+  // ⚠️ 本函数每 30 秒被 loadHealth 调一次，所以必须去重：同一个故障只弹一次，
+  //    恢复可用后再出问题才会重新弹。持续状态由侧栏「账号池 0 / N」的配色体现。
+  if(total>0 && avail===0){
+    if(!state.acctWarned){
+      state.acctWarned=true;
+      var allOff=det.length>0&&det.every(function(a){return !a.enabled;});
+      if(allOff){
+        toast("err","没有可用账号",
+          "账号池里的 <b>"+total+" 个账号全部被停用</b>，请求会直接失败（429）。"+
+          "到「账号」页点「全部启用」，或逐个启用要用的账号。");
+      }else{
+        toast("warn","没有可用账号",
+          "当前 "+total+" 个账号都在冷却中，请求会直接返回 429。"+
+          "可以在「账号」页点「重置全部冷却」立即重试，或等冷却结束自动恢复。");
+      }
+    }
+  }else{
+    state.acctWarned=false;   // 恢复可用，下次故障重新提示
+  }
   if(!$("v-accounts").hidden) renderAccts();
 }
 function goConfig(){ showTab("config"); $("key").focus(); }
 function goAccounts(){ showTab("accounts"); }
 
 function loadHealth(){
-  return fetch("/v1/health",{cache:"no-store"}).then(function(r){return r.json();}).then(renderHealth).catch(function(){
-    $("keySq").className="sq bad";
-    $("keyTxt").textContent="无法连接服务";
-    $("poolV").textContent="-"; $("poolV").className="v bad";
-  });
+  return fetch("/v1/health",{cache:"no-store"})
+    .then(function(r){
+      if(!r.ok) throw new Error("服务返回 HTTP "+r.status);
+      return r.json();
+    })
+    .then(function(h){
+      if(state.healthDown){ state.healthDown=false; toast("ok","服务已恢复","已重新连上本地服务。"); }
+      renderHealth(h);
+    })
+    .catch(function(e){
+      $("keySq").className="sq bad";
+      $("keyTxt").textContent="无法连接服务";
+      $("poolV").textContent="-"; $("poolV").className="v bad";
+      // 每 30 秒轮询一次，失败时只提示一遍，避免刷屏；恢复后再失败才会重新提示。
+      if(state.healthDown) return;
+      state.healthDown=true;
+      toastError("无法连接服务", e, diagHint());
+    });
+}
+
+/* 连接失败时给出可执行的排查方向。
+   单独抽出来是因为这三条覆盖了绝大多数情况，而原来的界面只说"无法连接服务"，
+   既没区分原因也没有下一步动作。 */
+function diagHint(){
+  return "排查顺序：<br>"+
+    "1. 服务进程还在吗？看启动窗口是否被关掉或按了 Ctrl+C，重新运行 start.bat / start.sh。<br>"+
+    "2. 地址对得上吗？确认访问的是 <code>http://localhost:8787</code>，"+
+    "改过 <code>PORT</code> 的话端口要跟着换；也别用 <code>https</code>（本服务没有证书）。<br>"+
+    "3. 页面是从服务打开的，还是直接双击了 .html 文件？"+
+    "直接打开文件时请求发不到服务端，必须通过 <code>http://localhost:8787</code> 访问控制台。";
 }
 
 /* ══ 账号页 ══ */
+
+// 冷却原因 → 中文说明。抽出来是因为卡片和概览都要用。
+function coolLabel(reason){
+  if(reason==="limit") return "额度用尽";
+  if(reason==="empty") return "空响应";
+  if(reason==="auth") return "鉴权失败";
+  return "冷却中";
+}
+// 秒 → 人类可读的剩余时间
+function fmtDur(sec){
+  if(!sec||sec<=0) return "-";
+  if(sec<60) return Math.ceil(sec)+" 秒";
+  if(sec<3600) return Math.ceil(sec/60)+" 分钟";
+  var h=Math.floor(sec/3600), m=Math.round((sec%3600)/60);
+  return h+" 时"+(m?" "+m+" 分":"");
+}
+// 相对时间："刚刚 / 3 分钟前"，用于最后一次使用/报错
+function fmtAgo(ts){
+  if(!ts) return "";
+  var d=Math.floor((Date.now()-ts)/1000);
+  if(d<10) return "刚刚";
+  if(d<60) return d+" 秒前";
+  if(d<3600) return Math.floor(d/60)+" 分钟前";
+  if(d<86400) return Math.floor(d/3600)+" 小时前";
+  return Math.floor(d/86400)+" 天前";
+}
+
+/* 一个账号的卡片。
+   布局：头部（序号+邮箱+来源+状态徽标）→ 数据格 → 最后错误行 → 动作排。 */
+function acctCard(a){
+  var st = !a.enabled ? "off" : (a.available ? "live" : "cool");
+  var badge = !a.enabled
+    ? '<span class="badge off">已停用</span>'
+    : (a.available ? '<span class="badge live">可用</span>'
+                   : '<span class="badge cool">冷却中</span>');
+
+  // 冷却：只在真的冷却时显示剩余时间；可用账号显示 token 缓存状态更有用
+  var coolV, coolCls;
+  if(!a.enabled){ coolV="—"; coolCls="dim"; }
+  else if(a.available){ coolV="无"; coolCls="dim"; }
+  else { coolV=fmtDur(a.cooldown_seconds); coolCls="warn"; }
+  var coolK = (!a.enabled||a.available) ? "冷却" : "冷却（"+coolLabel(a.cooldown_reason)+"）";
+
+  var s = a.stats || {};
+  // 成功率：只在有调用记录时显示，否则显示 "—"（避免 0% 的误导）
+  var total = (s.ok||0)+(s.fail||0);
+  var rateV = total ? Math.round((s.ok||0)/total*100)+"%" : "—";
+  var rateCls = !total ? "dim" : (total && (s.ok||0)/total>=0.8 ? "ok" : ((s.ok||0)/total>=0.5?"warn":"bad"));
+
+  var email = a.email || ("账号 #"+(a.index+1));
+  var lastRow = s.last_error
+    ? '<div class="last" title="'+esc(s.last_error+(s.last_error_at?"（"+fmtAgo(s.last_error_at)+"）":""))+'">'+
+        '<span class="k">最后错误</span>'+esc(s.last_error)+'</div>'
+    : "";
+
+  // 环境变量账号不能移除（下次读取会重新出现），按钮就不显示，避免点了报错
+  var removeBtn = a.runtime
+    ? '<button class="xs danger" data-act="remove" data-id="'+esc(a.id)+'" title="从账号池移除（仅临时账号）">移除</button>'
+    : "";
+
+  return '<div class="acct '+st+'" data-id="'+esc(a.id)+'">'+
+    '<div class="hd">'+
+      '<span class="ix">'+(a.index+1)+'</span>'+
+      '<span class="who">'+
+        '<span class="ml" title="'+esc(email)+'">'+esc(email)+'</span>'+
+        '<span class="src">'+(a.runtime?'<b>临时</b>· 登录得到':'环境变量')+'</span>'+
+      '</span>'+
+      badge+
+    '</div>'+
+    '<div class="kv">'+
+      '<div><span class="k">'+esc(coolK)+'</span><span class="v '+coolCls+'">'+esc(coolV)+'</span></div>'+
+      '<div><span class="k">token 缓存</span><span class="v'+(a.token_cached?" ok":" dim")+'">'+(a.token_cached?"有":"无")+'</span></div>'+
+      '<div><span class="k">成功 / 失败</span><span class="v"><span class="ok">'+(s.ok||0)+'</span> / <span class="'+(s.fail?"bad":"dim")+'">'+(s.fail||0)+'</span></span></div>'+
+      '<div><span class="k">成功率</span><span class="v '+rateCls+'">'+rateV+'</span></div>'+
+      '<div><span class="k">最后使用</span><span class="v '+(s.last_used_at?"":"dim")+'">'+esc(s.last_used_at?fmtAgo(s.last_used_at):"—")+'</span></div>'+
+      '<div><span class="k">账号 ID</span><span class="v dim" title="'+esc(a.id)+'">'+esc(a.id.slice(0,6))+'</span></div>'+
+    '</div>'+
+    lastRow+
+    '<div class="act">'+
+      (a.enabled
+        ? '<button class="xs" data-act="disable" data-id="'+esc(a.id)+'" title="停止参与轮询（可用时仍保留在池里）">停用</button>'
+        : '<button class="xs" data-act="enable" data-id="'+esc(a.id)+'" title="重新参与轮询">启用</button>')+
+      '<button class="xs" data-act="reset" data-id="'+esc(a.id)+'" title="清除冷却与 token 缓存">重置冷却</button>'+
+      removeBtn+
+    '</div>'+
+  '</div>';
+}
+
 function renderAccts(){
   var det=(state.health&&state.health.account_details)||[];
   var g=$("accts");
+  var avail=det.filter(function(a){return a.available;}).length;
+  var off=det.filter(function(a){return !a.enabled;}).length;
+  var cool=det.filter(function(a){return a.enabled&&!a.available;}).length;
+
+  $("acOk").textContent=avail; $("acCool").textContent=cool;
+  $("acOff").textContent=off;  $("acTotal").textContent=det.length;
+
+  // 概览右侧一句话：把最该采取行动的情况说清楚
+  var hint="";
+  if(det.length&&avail===0){
+    hint = off===det.length
+      ? '<span style="color:var(--bad)">全部账号已停用，请求会直接失败</span>'
+      : '<span style="color:var(--warn)">当前没有可用账号，请求会返回 429</span>';
+  } else if(off>0){
+    hint='<span style="color:var(--ink-3)">'+off+' 个账号已停用，不参与轮询</span>';
+  } else if(det.length){
+    hint='<span style="color:var(--ok)">账号池就绪</span>';
+  }
+  $("acctHint").innerHTML=hint;
+
   if(!det.length){ g.innerHTML=""; $("acctEmpty").hidden=false; return; }
   $("acctEmpty").hidden=true;
-  g.innerHTML=det.map(function(a){
-    var cls=a.available?"live":"cool";
-    var cd="-";
-    if(!a.available&&a.cooldown_seconds){
-      cd=Math.ceil(a.cooldown_seconds/60)+"分";
-      if(a.cooldown_reason==="limit") cd+=" 额度";
-      else if(a.cooldown_reason==="empty") cd+=" 空响应";
-      else if(a.cooldown_reason==="auth") cd+=" 鉴权";
-    }
-    return '<div class="acct '+cls+'">'+
-      '<div class="top"><span class="ix">'+(a.index+1)+'</span>'+
-      '<span class="ml" title="'+esc(a.email||"未登录邮箱")+'">'+esc(a.email||("账号 #"+(a.index+1)))+'</span></div>'+
-      '<div class="st">'+(a.available?"可用":"冷却中")+'</div>'+
-      '<dl>'+
-        '<div><span class="k">来源</span><span class="v">'+(a.runtime?"登录（临时）":"环境变量")+'</span></div>'+
-        '<div><span class="k">token 缓存</span><span class="v">'+(a.token_cached?"有":"无")+'</span></div>'+
-        '<div><span class="k">冷却</span><span class="v">'+esc(cd)+'</span></div>'+
-      '</dl></div>';
-  }).join("");
+  g.innerHTML=det.map(acctCard).join("");
+}
+
+/* 账号控制：把动作发给服务端，用返回的最新账号列表直接刷新界面，
+   省掉一次 /v1/health 往返。 */
+function accountAction(action,id,btn){
+  var busyLabel = {disable:"停用中",enable:"启用中",reset:"重置中",remove:"移除中",
+                   enableAll:"启用中",resetAll:"重置中"}[action] || "处理中";
+  if(btn){ btn.disabled=true; flash(btn,busyLabel); }
+  var payload={action:action};
+  if(id) payload.id=id;
+
+  return fetch("/v1/accounts/action",{method:"POST",headers:authHeaders(),body:JSON.stringify(payload)})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){
+        toastError("账号操作失败："+action, o.d, "HTTP "+o.r.status);
+        // 服务端说找不到账号 → 多半是列表过期，顺手刷新一次
+        if(o.r.status===404) loadHealth();
+        return;
+      }
+      // 用返回的账号列表就地更新，页面立刻反映新状态
+      if(state.health) state.health.account_details=o.d.accounts;
+      if(state.health) state.health.account_count=o.d.accounts.length;
+      recalcHealthCounts();
+      renderAccts(); renderHealth(state.health);
+      if(o.d.message) toast("ok","已完成", esc(o.d.message));
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("账号操作请求失败", e); });
+}
+
+// /v1/health 的聚合字段在本地更新后要跟着重算，否则侧栏数字会和卡片对不上
+function recalcHealthCounts(){
+  var h=state.health; if(!h||!h.account_details) return;
+  h.account_count=h.account_details.length;
+  h.accounts=h.account_count;
+  h.accounts_available=h.account_details.filter(function(a){return a.available;}).length;
+  h.runtime_accounts=h.account_details.filter(function(a){return a.runtime;}).length;
 }
 
 /* ── 登录 ── */
@@ -2287,8 +2889,10 @@ function startLogin(){
     .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
     .then(function(o){
       if(!o.r.ok||!o.d.ok){
-        $("loginBody").innerHTML='<div class="err"><b>无法开始登录：</b>'+esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+'</div>'+
+        var lm=(o.d.error&&o.d.error.message)||("HTTP "+o.r.status);
+        $("loginBody").innerHTML='<div class="err"><b>无法开始登录：</b>'+esc(lm)+'</div>'+
           '<div style="margin-top:11px"><button class="ghost" onclick="startLogin()">重试</button></div>';
+        toast("err","无法开始登录", esc(lm));
         return;
       }
       state.login={device_code:o.d.device_code,expires_in:o.d.expires_in,started:Date.now(),interval:o.d.interval};
@@ -2297,6 +2901,7 @@ function startLogin(){
     })
     .catch(function(e){
       $("loginBody").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+'</div>';
+      toastError("登录请求异常", e);
     });
 }
 function renderLogin(d){
@@ -2343,6 +2948,7 @@ function finishLogin(ok,payload){
     state.login=null;
     $("loginBody").innerHTML='<div class="err"><b>登录未完成：</b>'+esc(payload)+'</div>'+
       '<div style="margin-top:11px"><button class="ghost" onclick="startLogin()">重新登录</button></div>';
+    toast("warn","登录未完成", esc(payload));
     return;
   }
   state.login=null;
@@ -2356,6 +2962,8 @@ function finishLogin(ok,payload){
       '<button class="ghost" id="btnDoneLogin">完成</button></div>';
   $("btnCopyRt").addEventListener("click",function(){ copyText(rt,$("btnCopyRt"),$("rtBox")); });
   $("btnDoneLogin").addEventListener("click",function(){ $("loginBox").hidden=true; $("loginBody").innerHTML=""; });
+  toast("ok","账号已加入账号池"+(payload.email?"（"+payload.email+"）":""),
+    "可以立即使用。注意它<b>重启后会消失</b>，要长期保留请复制页面上的 refreshToken 填进环境变量。");
   setTimeout(loadHealth,400);
 }
 function cancelLogin(){
@@ -2723,6 +3331,7 @@ function send(){
           state.messages.push({role:"assistant",content:hint,error:true,stats:[{t:"HTTP "+r.status,lo:true}]});
           renderThread(); persistMsgs();
           $("cmeta").textContent="失败 · "+fmtMs(performance.now()-t0);
+          toast("err","请求失败 · HTTP "+r.status, esc(hint));
           addLog({kind:"chat",model:state.model,stream:state.stream,ok:false,status:r.status,totalMs:performance.now()-t0,
             error:"HTTP "+r.status+" "+et.slice(0,400),hint:hint,requestBody:reqBody,responseRaw:et.slice(0,6000)});
         });
@@ -2795,12 +3404,20 @@ function send(){
     })
     .catch(function(e){
       var stopped=String(e&&e.name)==="AbortError";
-      state.messages.push({role:"assistant",content:stopped?(content||"(已停止)"):("请求异常："+String(e&&e.message||e)),
+      var msg=String(e&&e.message||e);
+      state.messages.push({role:"assistant",content:stopped?(content||"(已停止)"):("请求异常："+msg),
         reasoning:reasoning,error:!stopped,stats:[{t:stopped?"已手动停止":"异常",lo:true},{t:"已接收 "+chars+" 字"}]});
       renderThread(); persistMsgs();
       $("cmeta").textContent=stopped?"已停止":"异常";
+      if(!stopped){
+        // 流式中断和"发不出去"是两回事：前者服务在跑，后者通常是服务没起来
+        var hint = ttft
+          ? "连接在生成过程中中断，已收到的内容仍保留在对话里。"
+          : diagHint();
+        toastError("请求异常", e, hint);
+      }
       addLog({kind:"chat",model:state.model,stream:state.stream,ok:false,status:null,ttft:ttft,totalMs:performance.now()-t0,chars:chars,stopped:stopped,
-        error:stopped?null:String(e&&e.message||e),hint:stopped?"你手动停止了生成，已收到的内容仍保留。":"请求异常，确认服务是否在运行。",
+        error:stopped?null:msg,hint:stopped?"你手动停止了生成，已收到的内容仍保留。":"请求异常，确认服务是否在运行。",
         requestBody:reqBody,responseRaw:raw.slice(0,6000)});
     })
     .then(function(){
@@ -3060,6 +3677,20 @@ $("btnTestAll").addEventListener("click",testAll);
 $("btnStopTest").addEventListener("click",function(){ state.testing=false; });
 $("btnRefreshAcct").addEventListener("click",function(){ loadHealth(); });
 $("btnLogin").addEventListener("click",startLogin);
+
+/* 账号卡片上的动作按钮与批量按钮：统一走事件委托，
+   这样 renderAccts 重绘多少次都不用重新绑定。 */
+function onAcctBarClick(e){
+  var b=e.target.closest&&e.target.closest("button[data-act]");
+  if(!b) return;
+  var act=b.getAttribute("data-act"), id=b.getAttribute("data-id")||"";
+  // 破坏性动作先确认：移除账号无法撤销（停用可以随时启用，不必打扰）
+  if(act==="remove"&&!confirm("移除这个临时账号？\\n\\n它只存在于当前实例内存，移除后需要重新登录才能恢复。")) return;
+  accountAction(act,id,b);
+}
+$("accts").addEventListener("click",onAcctBarClick);
+$("btnEnableAll").addEventListener("click",function(){ accountAction("enableAll","",this); });
+$("btnResetAll").addEventListener("click",function(){ accountAction("resetAll","",this); });
 $("btnLoginCancel").addEventListener("click",cancelLogin);
 $("btnSend").addEventListener("click",send);
 $("btnStop").addEventListener("click",stopGen);
@@ -3154,6 +3785,16 @@ function errorResponse(e) {
         retry_after_seconds: secs,
       },
     }, 429, { "Retry-After": String(secs) });
+  }
+  if (e && e.message === "all_accounts_disabled") {
+    return jsonResponse({
+      error: {
+        message: `账号池里的 ${e.accountCount} 个账号全部处于「停用」状态，没有账号可用来处理请求。` +
+                 `请在控制台「账号」页启用至少一个账号。`,
+        type: "rate_limit_error",
+        reason: "all_accounts_disabled",
+      },
+    }, 429);
   }
   if (e && e.message === "缺少 CLINE_REFRESH_TOKEN 环境变量") {
     return jsonResponse({
