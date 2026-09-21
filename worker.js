@@ -47,188 +47,416 @@ const WORKOS_CLIENT_ID = "client_01K3A541FN8TA3EPPHTD2325AR";
 //   enabled 是否参与轮询；停用后跳过但不从池里移除（环境变量账号只能这样"下线"）
 //   stats   成功/失败计数与最后一次错误，供控制台展示
 let accounts = [];
-// 运行时通过控制台登录追加的账号。只存在当前实例内存里，**重启或部署后消失**，
-// 因此登录成功后必须把 refreshToken 存进部署环境变量才算真正落地。
-let dynamicAccounts = [];
+// 运行时通过控制台登录追加的账号存在 runtimeState.dynamicAccounts 里（见「运行时
+// 设置」一节）。本地运行时由 local-server.js 落盘，所以**重启不丢**；云端没有可写
+// 磁盘，仍只活在内存里，登录成功页会提示把 refreshToken 存进环境变量。
 let accountIndex = 0;          // round-robin 游标
 let currentAccount = null;     // 当前正在使用的账号（串行队列下安全）
 
-// 模型列表：原样使用 Cline /v1/models 返回的完整模型 ID。
-// 不人为添加 cline/ 前缀；Telegram 会完整显示这些 ID，避免不同供应商模型名被截断后混淆。
-const MODELS = [
-  { id: "cline-free/deepseek-v4.1-flash", upstream: "cline-free/deepseek-v4.1-flash", provider: "cline", cost: "free" },
-  { id: "deepseek/deepseek-v4-flash", upstream: "deepseek/deepseek-v4-flash", provider: "deepseek", cost: "free" },
-  { id: "poolside/laguna-s-2.1:free", upstream: "poolside/laguna-s-2.1:free", provider: "poolside", cost: "free" },
-  { id: "cline-pass/glm-5.2", upstream: "cline-pass/glm-5.2", provider: "zai", cost: "pass" },
-  { id: "cline-pass/deepseek-v4-flash", upstream: "cline-pass/deepseek-v4-flash", provider: "deepseek", cost: "pass" },
-  { id: "cline-pass/qwen3.7-max", upstream: "cline-pass/qwen3.7-max", provider: "qwen", cost: "pass" },
-  { id: "zai/glm-5.3-flash", upstream: "zai/glm-5.3-flash", provider: "zai", cost: "free" },
-];
-
-// ============ 动态模型列表 ============
-// 优先从 Cline 官方 /v1/models 拉取, 失败回退到上面内置列表。
-// 每 10 分钟刷新一次缓存。
-
-// 免费模型白名单：人工实测确认免费、但名字里没有免费标记的模型。
+// ===========================================================================
+// 模型库
 //
-// 为什么需要它：上游 /v1/models 每个对象只有 id/object/created/owned_by 四个
-// 字段，**完全不含价格信息**，无法从响应里判断谁免费。所以模型列表只放行两类：
-//   1) 名字里带 :free 后缀的（上游明确的免费标记）
-//   2) 下面这张白名单里实测确认免费的
-// 其余一律不进列表——列表只列"确定能白嫖"的，客户端不会拿到 402/403 白试。
+// 数据来自 Cline 官方的两个接口（都只对 cline 自家域名放行 CORS，浏览器直连会被
+// 拦截，所以统一由服务端抓取后转发给控制台）：
 //
-// 维护方式：实测确认免费就加进来，发现失效（404 / 402）就删掉。
-const FREE_WHITELIST = [
-  "deepseek/deepseek-v4-flash",
-  "deepseek/deepseek-v4-flash-0731",
-  "z-ai/glm-5.3-flash",
-  "z-ai/glm-5.2:free",
-  "xiaomi/mimo-v2.5",
-  "minimax/minimax-m3",
-  "poolside/laguna-s-2.1",
+//   /ai/cline/recommended-models  按用途分好的几组（推荐 / free / Pass / Cloud，
+//                                 实测 24 条），带 name / description / tags
+//   /ai/cline/models              上游全部可选模型（实测 446 条、约 500 KB），
+//                                 带 context_length / pricing 等字段
+//
+// 与旧实现（自动聚合免费白名单）的关键差别：**/v1/models 只回控制台里启用的模型**。
+// 旧实现把所有"实测免费"的模型自动塞给客户端，等于替用户做了选择，也没法控制客户端
+// 看到什么；现在由用户在面板里挑，挑过的才出现在 /v1/models。
+//
+// 与之配套的一条约束：**默认空列表时回退到内置推荐**，不能让新装的人拿到一个空
+// 模型列表——客户端拉不到模型会觉得服务坏了。
+// ===========================================================================
+
+// 内置推荐模型：全新的实例（还没在面板里启用过任何模型）时 /v1/models 返回这些。
+// 都是实测免费、且当前确认可用的通道；DEFAULT_MODEL 是其中的主力。
+const BUILTIN_MODELS = [
   "cline-free/deepseek-v4.1-flash",
-  "cline-free/muse-spark-1.3-contributor",
-  "cline-free/solar-pro4",
+  "deepseek/deepseek-v4-flash",
+  "z-ai/glm-5.3-flash",
+  "poolside/laguna-s-2.1:free",
 ];
 
-let modelsCache = null;
-let modelsCacheTime = 0;
-const MODELS_TTL = 10 * 60 * 1000; // 10 分钟
 
-async function refreshModels() {
+// 推荐清单的固定分组展示顺序；上游新增的分组按字典序排在末尾（不静默丢弃）。
+const RECOMMENDED_GROUP_ORDER = ["recommended", "free", "clinePass", "clineCloud"];
+const RECOMMENDED_GROUP_META = {
+  recommended: { title: "官方推荐", sub: "默认走免费额度", color: "var(--accent)" },
+  free: { title: "免费模型", sub: "官方免费额度，不需要 credits", color: "var(--ok)" },
+  clinePass: { title: "ClinePass", sub: "需要 cline-pass 订阅", color: "var(--warn)" },
+  clineCloud: { title: "Cline Cloud", sub: "走 Cline 云端额度", color: "var(--ink-2)" },
+};
+
+// 两个清单共用的缓存时长：同一个上游、同一类使用节奏，没有理由不同。
+const MODEL_CACHE_TTL = 30 * 60 * 1000;
+
+// 抓取超时。全部模型那份约 500 KB，给宽一点的时限——超时是硬失败，面板只能报错，
+// 代价比多等几秒大得多。
+const RECOMMENDED_TIMEOUT_MS = 15000;
+const CATALOG_TIMEOUT_MS = 30000;
+
+// 单次批量添加的条数上限。上游「全部模型」目前 446 条，这里是它的两倍多，
+// 既容得下正常用法（整组添加），也挡住异常的巨大数组。
+const MAX_BATCH_MODEL_IDS = 1000;
+
+// 模型 ID 里一律禁止的字符。选取原则：只禁掉"不可能出现在任何模型标识里、
+// 但会破坏下游字符串语法"的字符，避免收得过紧误伤真实模型名——像
+// openai/gpt-4.1-nano、cline-pass/qwen3.7-max 这类含 / . - 的 ID 必须照常可用。
+const MODEL_ID_FORBIDDEN = /[|'"`\\<>]/;
+const MAX_MODEL_ID_LENGTH = 200;
+
+const MODEL_CATALOG_URL = CLINE_API_BASE + "/ai/cline/models";
+const RECOMMENDED_URL = CLINE_API_BASE + "/ai/cline/recommended-models";
+
+// 缓存。分两份，各自独立刷新：面板的推荐分组先加载，全部模型只在用户展开折叠块时抓。
+const modelCache = {
+  recommended: { groups: null, at: 0, inflight: null },
+  catalog: { models: null, at: 0, inflight: null },
+};
+
+// 模型 ID 归一化：只去首尾空白。
+//
+// ⚠️ 刻意**不**去掉 `~` 前缀。上游清单里那 18 条 `~xxx-latest` 的波浪号是 ID 本身的
+// 一部分——上游自己回给我们的 canonical_slug 也带着它，而且每个 `~X` 在清单里都没有
+// 对应的非波浪号版本。旧实现把它当"别名标记"剥掉，那是基于一个已证实不成立的假设；
+// 在现在这套「启用的模型原样发给上游」的架构下，剥掉只会把这些模型打成不存在的 ID。
+function normalizeModelId(id) {
+  const raw = String(id === null || id === undefined ? "" : id);
+  return raw.trim();
+}
+
+// 模型 ID 校验。新增路径才需要它把门（见 normalizeExistingModelId 的说明）。
+function validateModelId(id) {
+  const s = normalizeModelId(id);
+  if (!s) return { ok: false, error: "模型 ID 不能为空" };
+  if (s.length > MAX_MODEL_ID_LENGTH) {
+    return { ok: false, error: "模型 ID 过长（上限 " + MAX_MODEL_ID_LENGTH + " 字符）" };
+  }
+  if (MODEL_ID_FORBIDDEN.test(s)) {
+    return { ok: false, error: "模型 ID 含非法字符（不允许 | ' \" ` \\ < >）" };
+  }
+  return { ok: true, id: s };
+}
+
+// 已存在的模型 ID 只做 ~ 归一化，不跑字符集校验。
+//
+// 为什么分开：校验只用于「新增」时把关，而下面这些路径面对的是**已经存下来的**
+// 历史数据。若在删除/设默认值也跑严格校验，早期入库的非法 ID 会变得
+// 「列得出来、却删不掉、也设不成默认」——删除是清理它们的唯一出口。
+function normalizeExistingModelId(id) {
+  return normalizeModelId(id);
+}
+
+// ---------------------------------------------------------------------------
+// 「已启用模型」状态（存在 runtimeState.models 里，随设置一起落盘）
+// ---------------------------------------------------------------------------
+
+function enabledModels() {
+  if (!Array.isArray(runtimeState.models)) runtimeState.models = [];
+  return runtimeState.models;
+}
+
+function isModelEnabled(id) {
+  const norm = normalizeExistingModelId(id);
+  return enabledModels().some((x) => normalizeExistingModelId(x) === norm);
+}
+
+// 真正生效的模型列表：用户在面板里启用过的；一个都没有时回退到内置推荐。
+//
+// 回退是必需的：全新实例（或用户把模型全删了）时 /v1/models 必须仍然有内容，
+// 否则客户端拉不到模型会判定服务不可用。
+function effectiveModelIds() {
+  const list = enabledModels();
+  const out = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const id = normalizeModelId(raw);
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    out.push(id);
+  };
+  for (const id of list) push(id);
+  if (!out.length) for (const id of BUILTIN_MODELS) push(id);
+  return out;
+}
+
+const DEFAULT_MODEL_MARK = "（当前默认）";
+
+function modelIdInUse(id) {
+  const norm = normalizeExistingModelId(id);
+  return effectiveModelIds().some((x) => x === norm);
+}
+
+// 默认模型：用户设的（且还在启用列表里），否则启用列表的第一个。
+//
+// "还在启用列表里"这个条件不能省：用户把设成默认的模型删掉后，若不回退，
+// 所有不带 model 的请求都会打到一个已被撤下的模型上。
+function defaultModelId() {
+  const want = normalizeExistingModelId(runtimeState.defaultModel || "");
+  if (want && modelIdInUse(want)) return want;
+  const eff = effectiveModelIds();
+  return eff[0] || DEFAULT_MODEL;
+}
+
+// 批量启用：语义与逐个启用等价，但只落盘一次（见 handleModelBatchAdd 的说明）。
+// 返回 { added, skipped, failed }，重复项计入 skipped 而不是报错 —— 因此
+// 「全部添加」可以安全地重复点击。
+function addModelIds(ids) {
+  const added = [];
+  const skipped = [];
+  const failed = {};
+  const list = enabledModels();
+  const seen = new Set();
+  for (const raw of Array.isArray(ids) ? ids : []) {
+    const v = validateModelId(raw);
+    if (!v.ok) { failed[String(raw)] = v.error; continue; }
+    if (seen.has(v.id)) { skipped.push(v.id); continue; }
+    seen.add(v.id);
+    if (list.some((x) => normalizeExistingModelId(x) === v.id)) { skipped.push(v.id); continue; }
+    added.push(v.id);
+  }
+  if (!added.length) return { added, skipped, failed };
+  // 先把内存改完，最后统一落一次盘（调用方负责 scheduleStateFlush）
+  const prev = list.slice();
+  for (const id of added) list.push(id);
+  runtimeState.models = list;
+  // 落盘失败无法回滚（没有同步的写盘结果），但下一次 flush 会重试——
+  // 这里记一条日志让用户能察觉，比静默丢改动好。
+  return { added, skipped, failed, prev };
+}
+
+function removeModelId(id) {
+  const target = normalizeExistingModelId(id);
+  const list = enabledModels();
+  const filtered = list.filter((x) => normalizeExistingModelId(x) !== target);
+  if (filtered.length === list.length) return false;
+  runtimeState.models = filtered;
+  // 删掉的正好是默认模型：清空，让 defaultModelId() 回退到列表第一个
+  if (normalizeExistingModelId(runtimeState.defaultModel || "") === target) {
+    runtimeState.defaultModel = "";
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// 上游抓取
+// ---------------------------------------------------------------------------
+
+async function fetchUpstreamJson(url, timeoutMs) {
+  const resp = await fetchWithTimeout(url, {
+    headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0 (cline2api)" },
+  }, timeoutMs);
+  if (!resp.ok) {
+    await resp.text().catch(() => "");
+    throw new Error("上游返回 HTTP " + resp.status);
+  }
+  // 约 500 KB 的响应体；上限 4 MiB 兜底，避免异常大响应把内存吃掉
+  const text = await resp.text();
+  if (text.length > (4 << 20)) throw new Error("上游响应过大");
+  return JSON.parse(text);
+}
+
+// 解析推荐清单成有序分组。上游若有新增分组，按字典序追加，避免静默丢弃。
+function parseRecommendedModels(raw) {
+  const groups = [];
+  const rest = [];
+  const keys = raw && typeof raw === "object" ? Object.keys(raw) : [];
+  for (const key of RECOMMENDED_GROUP_ORDER) {
+    const arr = raw[key];
+    if (!Array.isArray(arr) || !arr.length) continue;
+    groups.push({ key, models: arr.filter((m) => m && m.id).map(normalizeRemoteModel) });
+  }
+  for (const key of keys.sort()) {
+    if (RECOMMENDED_GROUP_ORDER.includes(key)) continue;
+    const arr = raw[key];
+    if (!Array.isArray(arr) || !arr.length) continue;
+    rest.push({ key, models: arr.filter((m) => m && m.id).map(normalizeRemoteModel) });
+  }
+  groups.push(...rest);
+  const total = groups.reduce((n, g) => n + g.models.length, 0);
+  if (!total) throw new Error("上游返回的模型列表为空");
+  return groups;
+}
+
+// 上游条目的字段保留策略：
+//   id / name / description / tags —— 面板要用（tags 渲染 NEW 角标）
+//   context_length / pricing       —— 全部模型清单才有，用于展示上下文与是否免费
+// 其余字段（architecture / supported_parameters / top_provider …）在解析时丢弃：
+// 完整响应约 500 KB，只留这几个能把面板拿到的数据量降一个数量级。
+function normalizeRemoteModel(m) {
+  const id = String(m.id || "");
+  return {
+    id,
+    name: typeof m.name === "string" && m.name ? m.name : id,
+    description: typeof m.description === "string" ? m.description : "",
+    tags: Array.isArray(m.tags) ? m.tags.filter((t) => typeof t === "string" && t) : [],
+    context_length: Number(m.context_length) || 0,
+    pricing: m.pricing && typeof m.pricing === "object" ? m.pricing : null,
+  };
+}
+
+function parseCatalogModels(raw) {
+  const data = raw && Array.isArray(raw.data) ? raw.data : null;
+  if (!data || !data.length) throw new Error("上游返回的模型列表为空");
+  return data.filter((m) => m && m.id).map(normalizeRemoteModel);
+}
+
+// 取数 + 缓存。语义（与上游一致，刻意做成同一个形状）：
+//   force 或缓存过期 → 回源
+//   fresh 未过期     → 直接返回缓存
+//   回源失败         → 退回过期缓存（stale=true）而不是让面板空白
+//
+// 网络请求放在锁外，且用 inflight 合并并发回源：面板刚打开时可能同时触发
+// 推荐分组与全部模型两个请求，各自 back-to-back 会打两次上游。
+async function cachedFetch(slot, force, fetchFn) {
+  const now = Date.now();
+  const fresh = slot.groups !== null || slot.models !== null;
+  const hasData = slot.groups !== null || slot.models !== null;
+  const age = now - slot.at;
+
+  if (!force && hasData && age < MODEL_CACHE_TTL) {
+    return { cached: true, stale: false };
+  }
+  if (slot.inflight) {
+    // 已有一次回源在跑：等它，避免并发重复打上游
+    try { await slot.inflight; } catch (e) { /* 失败由发起方处理 */ }
+    return { cached: true, stale: false };
+  }
+
+  const run = (async () => {
+    const data = await fetchFn();
+    if (slot.groups !== null || slot.models !== null) {
+      slot.data = data;
+    }
+    // 用统一字段存：groups 与 models 二选一，读的时候按同样的名字取
+    slot.groups = data.groups || null;
+    slot.models = data.models || null;
+    slot.at = Date.now();
+    slot.err = "";
+  })();
+  slot.inflight = run;
   try {
-    const now = Date.now();
-    if (modelsCache && now - modelsCacheTime < MODELS_TTL) {
-      return modelsCache;
-    }
-    const resp = await fetch(CLINE_API_BASE + "/models", {
-      headers: { "User-Agent": "Mozilla/5.0 (cline2api)" },
-    });
-    if (!resp.ok) {
-      console.log("[models] 官方拉取失败 HTTP", resp.status, "回退内置列表");
-      return MODELS;
-    }
-    const data = await resp.json();
-    if (!data || !Array.isArray(data.data) || data.data.length === 0) {
-      return MODELS;
-    }
-    // 只放行**确定免费**的模型，其余全部丢弃（见 FREE_WHITELIST 注释）。
-    // 判据只有两条：
-    //   1) 名字里带 :free 后缀 —— 上游明确的免费标记
-    //   2) FREE_WHITELIST 里人工实测确认免费的
-    // 上游 400+ 个模型里绝大多数既不满足 1 也不在 2，一律不进列表。
-    //
-    //   :batch 后缀 —— 额外排除。这类是上游的批处理专用通道，实测 6/6 全部
-    //     "HTTP 200 但 content 为空"，即使名字带 :free 也走不通普通对话接口。
-    //
-    //   ~ 前缀 —— 仅对通过筛选的模型生效：波浪号在 URL/配置里容易被转义或
-    //     误处理，所以去掉后对外，原始 ID 留在 upstream 字段便于排查。
-    const baseList = data.data
-      .filter((m) => {
-        const id = (m.id || "").replace(/^~/, "");
-        if (!id) return false;
-        if (id.endsWith(":batch")) return false;
-        return id.includes(":free") || FREE_WHITELIST.includes(id);
-      })
-      .map((m) => {
-        const raw = m.id || "";
-        const id = raw.replace(/^~/, "");
-        const prefix = id.split("/")[0] || "cline";
-        return { id, upstream: raw, provider: prefix, cost: "free", alias: raw !== id };
-      })
-      // 去重：~ 别名去波浪号后可能与本体同名（列表里同时有 deepseek/x 和
-      // ~deepseek/x 时），保留先出现的那条，避免同一模型在客户端出现两次
-      .filter((m, i, arr) => arr.findIndex((x) => x.id === m.id) === i);
-    // 合并官方分类：补入 free 数组里独有的模型（cline-free/* 不在 /v1/models 里，
-    // 若不做这步会漏掉官方免费通道，而它正是默认模型所在），并标注渠道来源
-    const { byId: recKind, list: freeExtra } = await refreshFreeModels();
-    for (const m of baseList) {
-      const kind = recKind[m.id];
-      if (kind === "free" || kind === "recommended") {
-        m.channel = kind === "free" ? "free" : "recommended";
-      } else if (FREE_WHITELIST.includes(m.id)) {
-        // 官方分类里没有，但人工实测确认免费 → 标为 verified，便于区分来源
-        m.channel = "verified";
-      } else {
-        // 官方分类也没覆盖（纯靠 :free 后缀进来的）
-        m.channel = "free-suffix";
-      }
-    }
-    for (const fm of freeExtra) {
-      const hit = baseList.find((b) => b.id === fm.id);
-      if (hit) {
-        hit.channel = "free";
-        if (!hit.label && fm.label) hit.label = fm.label;
-      } else {
-        fm.channel = "free";
-        baseList.push(fm);
-      }
-    }
-    modelsCache = baseList;
-    modelsCacheTime = now;
-    console.log("[models] 动态拉取成功:", modelsCache.length, "个免费模型（白名单 " + FREE_WHITELIST.length + " 项 + :free 后缀）");
-    return modelsCache;
+    await run;
+    return { cached: false, stale: false };
   } catch (e) {
-    console.log("[models] 拉取异常:", String(e).slice(0, 100), "回退内置列表");
-    return MODELS;
+    // 回源失败：有旧数据就退回旧的（标记 stale 让面板提示），没有就报错
+    if (hasData) {
+      slot.err = String((e && e.message) || e);
+      return { cached: true, stale: true, error: slot.err };
+    }
+    throw e;
+  } finally {
+    slot.inflight = null;
   }
 }
 
+async function recommendedSnapshot(force) {
+  const slot = modelCache.recommended;
+  const res = await cachedFetch(slot, force, async () => ({
+    groups: parseRecommendedModels(await fetchUpstreamJson(RECOMMENDED_URL, RECOMMENDED_TIMEOUT_MS)),
+  }));
+  return {
+    groups: slot.groups || [],
+    fetchedAt: slot.at,
+    cached: res.cached,
+    stale: !!res.stale,
+    error: res.error || "",
+    isFresh: !res.cached,
+  };
+}
 
-// =====================================================================
-// Cline 官方模型分类（逆向自插件 recommended-models 接口）
-// 官方插件用 https://api.cline.bot/api/v1/ai/cline/recommended-models 取模型，
-// 该接口返回四个**权威分类数组**：
-//   recommended  官方推荐（默认走免费额度）
-//   free         明确免费，走官方免费额度、不需要 credits
-//   clinePass    需 cline-pass 订阅
-//   clineCloud   走 Cline 云端额度
-// 这是唯一可靠的"价格/渠道"来源——上游 /v1/models 的对象只有
-// id/object/created/owned_by，完全不含价格字段，所以不能靠猜。
-// =====================================================================
-async function refreshFreeModels() {
-  try {
-    const resp = await fetch(CLINE_API_BASE + "/ai/cline/recommended-models", {
-      headers: { "User-Agent": "Mozilla/5.0 (cline2api)" },
-    });
-    if (!resp.ok) return { byId: {}, list: [] };
-    const data = await resp.json();
+async function catalogSnapshot(force) {
+  const slot = modelCache.catalog;
+  const res = await cachedFetch(slot, force, async () => ({
+    models: parseCatalogModels(await fetchUpstreamJson(MODEL_CATALOG_URL, CATALOG_TIMEOUT_MS)),
+  }));
+  return {
+    models: slot.models || [],
+    fetchedAt: slot.at,
+    cached: res.cached,
+    stale: !!res.stale,
+    error: res.error || "",
+    isFresh: !res.cached,
+  };
+}
 
-    // 把四个数组映射成 "id -> 分类"，供 /v1/models 标注每个模型
-    const byId = {};
-    const take = (arr, kind) => {
-      if (!Array.isArray(arr)) return;
-      for (const m of arr) {
-        if (m && m.id) byId[m.id] = kind;
-      }
-    };
-    take(data.free, "free");
-    take(data.recommended, "recommended");
-    take(data.clinePass, "pass");
-    take(data.clineCloud, "cloud");
-
-    // free 数组里的模型要**额外并入**模型池：其中 cline-free/* 不在 /v1/models 里，
-    // 若只做标注就会漏掉官方免费通道（这正是主力模型）。
-    const list = (Array.isArray(data.free) ? data.free : [])
-      .filter((m) => m && m.id)
-      .map((m) => ({
-        id: m.id,
-        upstream: m.id,
-        provider: m.id.split("/")[0] || "cline",
-        cost: "free",
-        label: m.name || "",
-      }));
-
-    return { byId, list };
-  } catch (e) {
-    return { byId: {}, list: [] };
+// 按模型 ID 的供应商前缀分组（上游没有可用的供应商字段，而 id 本身就是
+// vendor/model 形式，所以以前缀为准）。
+//
+// `~` 前缀只在这里剥掉、**只用于分组**：`~deepseek/deepseek-pro-latest` 的供应商是
+// deepseek 而不是 "~deepseek"，但 ID 本身必须原样保留（波浪号是它的一部分）。
+//
+// 组按模型数从多到少排、组内按名称排 —— 上游返回顺序不保证稳定，按固定规则排序
+// 才能让每次渲染结果一致。
+function groupCatalogModels(models) {
+  const map = new Map();
+  for (const m of models) {
+    const key = normalizeModelId(m.id).replace(/^~/, "").split("/")[0] || "其它";
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(m);
   }
+  const groups = [];
+  for (const [key, list] of map) {
+    list.sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+    groups.push({ key, models: list });
+  }
+  groups.sort((a, b) => b.models.length - a.models.length || a.key.localeCompare(b.key));
+  return groups;
+}
+
+// ---------------------------------------------------------------------------
+// 「模型已启用」视图：把启用列表补上展示所需的元信息
+//
+// 启用列表本身只存 ID（落盘文件越小越好，上游数据随时会变，存快照等于埋下过期数据）。
+// 展示时现查推荐/全部模型缓存补 name / description / context —— 缓存里没有的（比如
+// 用户手填的 ID、或上游已下架的）就退回把 ID 当名字显示，不假装知道。
+// ---------------------------------------------------------------------------
+
+function findRemoteModel(id) {
+  const norm = normalizeModelId(id);
+  for (const slot of [modelCache.catalog, modelCache.recommended]) {
+    const lists = slot.models ? [slot.models] : (slot.groups || []).map((g) => g.models);
+    for (const list of lists) {
+      for (const m of list) if (normalizeModelId(m.id) === norm) return m;
+    }
+  }
+  return null;
+}
+
+function modelView(id) {
+  const norm = normalizeModelId(id);
+  const remote = findRemoteModel(norm);
+  return {
+    id: norm,
+    name: (remote && remote.name) || norm,
+    description: (remote && remote.description) || "",
+    context_length: (remote && remote.context_length) || 0,
+    pricing: (remote && remote.pricing) || null,
+    is_default: normalizeExistingModelId(runtimeState.defaultModel || "") === norm,
+    // 内置推荐里的模型即使没在上游缓存里也标记出来，便于用户理解它从哪来
+    builtin: BUILTIN_MODELS.includes(norm),
+  };
+}
+
+// 上游缓存里查得到这个模型吗？用于提示"手填的 ID 可能拼错了"。
+// 只在下游都不认识时才返回 false；两份缓存都还没抓过时返回 true（不知道，别乱提示）。
+function modelKnownUpstream(id) {
+  const norm = normalizeModelId(id);
+  const anyLoaded = modelCache.catalog.models !== null || modelCache.recommended.groups !== null;
+  if (!anyLoaded) return true;
+  if (findRemoteModel(norm)) return true;
+  // 上游也查不到：可能是 panel 里手填的私有通道，所以只是「未确认」而不是错误
+  return false;
 }
 
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "2.3.0";
+const VERSION = "2.4.1";
 
 // ===== 入口 =====
 // Cloudflare Workers 入口。Vercel 入口由 build-vercel.mjs 依据下面的
@@ -241,7 +469,280 @@ export default {
 };
 // #endregion entry
 
+// 控制台用的完整状态。与 /v1/health 的区别：本端点**需要 API_KEY**，
+// 所以可以下发账号明细（邮箱、每个账号的 token 用量）。
+// /v1/health 保持精简（免鉴权），只回答「服务在不在、有没有账号」。
+function handleStatus(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  const summaries = accountSummaries(env);
+  return jsonResponse({
+    ok: true,
+    version: VERSION,
+    account_count: summaries.length,
+    accounts_available: summaries.filter((a) => a.available).length,
+    runtime_accounts: summaries.filter((a) => a.runtime).length,
+    account_details: summaries,
+    cooldowns: cooldownSnapshot(),
+    cooldown_minutes: cooldownMinutes(),
+    strategy: runtimeState.strategy,
+    default_model: defaultModelId(),
+    // 客户端能从 /v1/models 看到几个模型；用它替代旧的 models_cached
+    models_available: effectiveModelIds().length,
+    // 云端没有可写磁盘时前端要据此提示用户
+    persisted: !!statePersistCb,
+  }, 200, { "Cache-Control": "no-store" });
+}
+
+// ---------------------------------------------------------------------------
+// 设置与上游渠道（控制台用）
+// ---------------------------------------------------------------------------
+
+// 设置项的对外视图（供控制台渲染表单）
+function configView() {
+  const ids = effectiveModelIds();
+  return {
+    strategy: runtimeState.strategy,
+    headers: { ...(runtimeState.headers || {}) },
+    headers_complete: !!runtimeState.headersComplete,
+    default_headers: { ...CLINE_FINGERPRINT_HEADERS },
+    // 默认模型下拉的选项 = 已启用模型（不是上游全部模型：四百多个没法选）
+    default_model: defaultModelId(),
+    default_model_options: ids.map(modelView),
+    using_builtin_models: enabledModels().length === 0,
+    builtin_models: BUILTIN_MODELS.slice(),
+    cooldown_minutes: cooldownMinutes(),
+    override_prompt: runtimeState.overridePrompt || "",
+    // 云端没有可写磁盘：告诉前端「改了能不能存住」，界面据此提示用户
+    persisted: !!statePersistCb,
+    version: VERSION,
+  };
+}
+
+async function handleConfig(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+
+  if (request.method === "GET") {
+    return jsonResponse({ ok: true, ...configView() }, 200);
+  }
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "config_error" } }, 405);
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+
+  // ---- 先把所有参数校验完，再做任何修改 ----
+  // 否则会出现「客户端收到 400，但服务端已部分生效」的不一致。
+  const next = { ...runtimeState };
+  const changedCooldown = [];
+
+  if (body.strategy !== undefined) {
+    if (!["round_robin", "fill", "random"].includes(body.strategy)) {
+      return jsonResponse({
+        error: { message: "strategy 必须是 round_robin / fill / random 之一", type: "config_error" },
+      }, 400);
+    }
+    next.strategy = body.strategy;
+  }
+
+  if (body.cooldown_minutes !== undefined) {
+    const m = Number(body.cooldown_minutes);
+    // 允许 1~1440（1 分钟到 1 天）；0 视为恢复默认
+    if (!Number.isFinite(m) || m < 0 || m > 1440) {
+      return jsonResponse({
+        error: { message: "cooldown_minutes 必须是 0~1440（0 = 恢复默认 30）", type: "config_error" },
+      }, 400);
+    }
+    const applied = m === 0 ? 30 : Math.round(m);
+    if (applied !== cooldownMinutes()) changedCooldown.push(applied);
+    next.cooldownMinutes = applied;
+  }
+
+  if (body.default_model !== undefined) {
+    const id = String(body.default_model || "").trim();
+    if (id) {
+      // 只能把**已启用**的模型设为默认：默认模型是"不带 model 的请求打哪个"，
+      // 指向一个没启用的模型会让面板显示与真实行为对不上。
+      if (!isModelEnabled(id)) {
+        return jsonResponse({
+          error: {
+            message: "默认模型必须是已启用的模型：" + id + "（请先在「模型」页添加它）",
+            type: "config_error",
+          },
+        }, 400);
+      }
+      next.defaultModel = normalizeExistingModelId(id);
+    } else {
+      next.defaultModel = "";
+    }
+  }
+
+  if (body.override_prompt !== undefined) {
+    if (typeof body.override_prompt !== "string") {
+      return jsonResponse({ error: { message: "override_prompt 必须是字符串", type: "config_error" } }, 400);
+    }
+    next.overridePrompt = body.override_prompt;
+  }
+
+  if (body.headers !== undefined) {
+    if (!body.headers || typeof body.headers !== "object" || Array.isArray(body.headers)) {
+      return jsonResponse({ error: { message: "headers 必须是对象", type: "config_error" } }, 400);
+    }
+    const clean = {};
+    for (const [k, v] of Object.entries(body.headers)) {
+      const key = String(k || "").trim();
+      if (!key) continue;
+      // 头名里不能有冒号/换行，否则会构造出畸形请求（请求头注入）
+      if (/[\r\n:]/.test(key)) {
+        return jsonResponse({
+          error: { message: "请求头名称不合法：" + key, type: "config_error" },
+        }, 400);
+      }
+      if (typeof v !== "string") {
+        return jsonResponse({
+          error: { message: "请求头 " + key + " 的值必须是字符串", type: "config_error" },
+        }, 400);
+      }
+      if (/[\r\n]/.test(v)) {
+        return jsonResponse({
+          error: { message: "请求头 " + key + " 的值不能包含换行", type: "config_error" },
+        }, 400);
+      }
+      if (v) clean[key] = v;
+    }
+    // replace_headers=true 表示整体替换（支持删除内置头）；否则与现有值合并
+    next.headers = body.replace_headers === true ? clean : { ...(runtimeState.headers || {}), ...clean };
+    next.headersComplete = body.replace_headers === true ? true : !!runtimeState.headersComplete;
+  }
+
+  runtimeState = next;
+  scheduleStateFlush();
+  // 冷却时长改了：已生效的冷却按旧时长算，清掉让新配置立刻生效。
+  // 不清的话用户改小了值却要等旧冷却走完，会以为设置没生效。
+  if (changedCooldown.length) {
+    const n = clearAllCooldowns();
+    if (n) console.log("[config] 冷却时长已变更，清除 " + n + " 条旧冷却记录");
+  }
+  return jsonResponse({ ok: true, ...configView() }, 200);
+}
+
+// 上游渠道配置（列表 / 保存 / 删除 / 探测）
+async function handleUpstreams(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  const url = new URL(request.url);
+  const action = (url.searchParams.get("action") || "list").trim();
+
+  if (request.method === "GET" && action === "list") {
+    // 上游渠道配置的「模型」下拉用**已启用模型**：给用户配渠道的是一个他真在用的
+    // 模型，列四百多个全部模型只会让下拉变得没法用。
+    const models = effectiveModelIds();
+    // 把配置按「模型 ID」平铺出来，另附上别名指向的条目，前端一次就能渲染完整列表
+    const items = Object.entries(runtimeState.perModel)
+      .map(([modelId, cfg]) => ({ model_id: modelId, ...cfg }))
+      .sort((a, b) => a.model_id.localeCompare(b.model_id));
+    return jsonResponse({
+      ok: true,
+      upstreams: items,
+      models,
+      pipelines: [PIPELINE_DIRECT, PIPELINE_PLANNER],
+    }, 200);
+  }
+
+  if (request.method === "GET" && action === "probe_status") {
+    const id = url.searchParams.get("jobId") || "";
+    const job = probeJobs.get(id);
+    if (!job) {
+      return jsonResponse({
+        error: { message: "探测任务已过期或服务已重启，请重新探测", type: "probe_error" },
+      }, 404);
+    }
+    return jsonResponse({ ok: true, job }, 200, { "Cache-Control": "no-store" });
+  }
+
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "upstream_error" } }, 405);
+  }
+
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+
+  if (action === "probe") {
+    const modelId = String(body.model_id || "").trim();
+    if (!modelId) {
+      return jsonResponse({ error: { message: "缺少 model_id", type: "probe_error" } }, 400);
+    }
+    const started = startProbeJob(modelId, probeModelUpstreams, "probe");
+    if (started.error) {
+      return jsonResponse({ error: { message: started.error, type: "probe_error" } }, started.status,
+        { "Retry-After": "2" });
+    }
+    return jsonResponse({
+      ok: true,
+      job: started.job,
+      shared: started.shared,
+      message: started.shared ? "该模型已有一个探测在进行，共享其结果" : "探测已开始",
+    }, 202, { "Cache-Control": "no-store" });
+  }
+
+  if (action === "save") {
+    const modelId = String(body.model_id || "").trim();
+    if (!modelId) {
+      return jsonResponse({ error: { message: "缺少 model_id", type: "upstream_error" } }, 400);
+    }
+    // 把面板表单的值和已有探测缓存合并：面板不提交探出来的字段，直接整体替换会
+    // 把 available/pipeline 这些探测成果抹掉，用户就得重新探一次。
+    const existing = runtimeState.perModel[modelId] || {};
+    const merged = sanitizeUpstreamConfig({
+      ...existing,
+      ...body.config,
+      // 探测结果永远以缓存为准，不接受表单传入
+      pipeline: existing.pipeline,
+      available: existing.available,
+      observed: existing.observed,
+      lastProvider: existing.lastProvider,
+      probedAt: existing.probedAt,
+    });
+    if (!merged) {
+      delete runtimeState.perModel[modelId];
+      scheduleStateFlush();
+      return jsonResponse({ ok: true, message: "已清空该模型的渠道配置（恢复自动模式）", model_id: modelId }, 200);
+    }
+    merged.updatedAt = Date.now();
+    runtimeState.perModel[modelId] = merged;
+    scheduleStateFlush();
+    return jsonResponse({ ok: true, model_id: modelId, config: merged, message: "已保存" }, 200);
+  }
+
+  if (action === "delete") {
+    const modelId = String(body.model_id || "").trim();
+    if (!modelId) {
+      return jsonResponse({ error: { message: "缺少 model_id", type: "upstream_error" } }, 400);
+    }
+    const existed = !!runtimeState.perModel[modelId];
+    delete runtimeState.perModel[modelId];
+    scheduleStateFlush();
+    return jsonResponse({
+      ok: true,
+      message: existed ? "已删除该模型的渠道配置" : "该模型没有渠道配置",
+    }, 200);
+  }
+
+  return jsonResponse({ error: { message: "未知的 action: " + action, type: "upstream_error" } }, 400);
+}
+
 async function handleRequest(request, env) {
+  rememberEnv(env);
   const url = new URL(request.url);
   const path = url.pathname;
 
@@ -254,27 +755,31 @@ async function handleRequest(request, env) {
   }
 
   // 健康诊断端点（无需鉴权，用于排查环境变量是否生效）
-  // 字段同时提供 README 用的 api_key_configured/account_count 与旧名 authenticated/accounts
+  //
+  // ⚠️ 刻意只回「能不能用」这一层信息：完整账号明细（邮箱、每个账号的用量）
+  //    放在需要 API_KEY 的 /v1/accounts/action 里，因为本端点免鉴权——
+  //    部署到公网时，谁都能读到它。
   if (request.method === "GET" && (path === "/v1/health" || path === "/health")) {
-    const summaries = accountSummaries(env);
-    const now = Date.now();
     const keyConfigured = !!(env.API_KEY && env.API_KEY.trim());
+    const pool = listAccounts(env);
+    // 「可用」= 账号启用。冷却已经是「账号×模型」级，账号本身能不能用要看
+    // 具体是哪个模型，这里只回账号层的状态（明细在 /v1/status）。
+    const usable = pool.filter((a) => a.enabled).length;
     return jsonResponse({
       ok: true,
       version: VERSION,
       api_key_configured: keyConfigured,
-      account_count: summaries.length,
+      account_count: pool.length,
       // 兼容旧字段名（README 早期版本用的是这两个）
       authenticated: keyConfigured,
-      accounts: summaries.length,
-      accounts_available: summaries.filter((a) => a.available).length,
-      // 每个账号的状态明细，供控制台展示账号池（不含任何 token 内容）
-      account_details: summaries,
-      runtime_accounts: accounts && accounts.filter((a) => a.runtime).length || 0,
-      model: DEFAULT_MODEL,
-      models_cached: modelsCache ? modelsCache.length : 0,
-      // token 用量统计（含按模型/按天/按账号拆分）。本端点不鉴权，本地自用没问题；
-      // 部署到公网时它会公开你的用量规模，介意就把这段挪到独立鉴权端点。
+      accounts: pool.length,
+      accounts_available: usable,
+      // 客户端能从 /v1/models 看到几个模型（含"没有启用过 → 回退内置推荐"的情况）
+      models_available: effectiveModelIds().length,
+      default_model: defaultModelId(),
+      strategy: runtimeState.strategy,
+      // 冷却中的组合数：介于「账号数」与「账号数×模型数」之间，是额度的真实粒度
+      cooling_combinations: cooldowns.size,
       usage: usageSummary(),
     }, 200);
   }
@@ -295,13 +800,37 @@ async function handleRequest(request, env) {
     return handleModels();
   }
 
-  // 账号登录（WorkOS 设备授权码流程）：在控制台里点按钮完成授权，无需跑 python 脚本。
-  // ⚠️ 必须鉴权：否则任何人都能把这个 Worker 当 OAuth 中转站用。
+  // ---- 需要鉴权的控制面端点 ----
   if (request.method === "POST") {
-    if (path === "/v1/login/start") return handleLoginStart(request, env);
+    if (path === "/v1/login/start") {
+      // OAuth 中转站被滥用的话，攻击者能用你的服务白嫖设备授权流程，所以限流
+      if (!allowLoginAttempt(clientIp(request))) {
+        return jsonResponse({
+          error: { message: "请求过于频繁，请稍后再试", type: "rate_limit_error" },
+        }, 429, { "Retry-After": "60" });
+      }
+      return handleLoginStart(request, env);
+    }
     if (path === "/v1/login/poll") return handleLoginPoll(request, env);
-    // 账号控制（启用/停用/重置冷却/移除），同样必须鉴权
     if (path === "/v1/accounts/action") return handleAccountAction(request, env);
+    if (path === "/v1/config") return handleConfig(request, env);
+    if (path === "/v1/upstreams") return handleUpstreams(request, env);
+    if (path === "/v1/models/batch") return handleModelBatchAdd(request, env);
+    if (path === "/v1/models/delete") return handleModelDelete(request, env);
+    if (path === "/v1/models/default") return handleModelSetDefault(request, env);
+    if (path === "/v1/models/check") return handleModelCheck(request, env);
+  }
+  if (request.method === "GET") {
+    if (path === "/v1/status") return handleStatus(request, env);
+    if (path === "/v1/accounts/detail") return handleAccountDetail(request, env);
+    if (path === "/v1/accounts/balance") return handleAccountBalance(request, env);
+    if (path === "/v1/config") return handleConfig(request, env);
+    if (path === "/v1/upstreams") return handleUpstreams(request, env);
+    if (path === "/v1/models/enabled") return handleModelEnabled(request, env);
+    if (path === "/v1/models/library" || path === "/v1/models/catalog") {
+      return handleModelLibrary(request, env);
+    }
+    if (path === "/v1/models/check") return handleModelCheck(request, env);
   }
 
   // POST 聊天端点
@@ -329,21 +858,39 @@ async function handleRequest(request, env) {
 // Token 管理
 // ---------------------------------------------------------------------------
 
+// 最近一次请求带来的 env。
+//
+// 为什么需要：后台任务（异步探测）没有请求上下文，但同样要读 CLINE_REFRESH_TOKEN
+// 拿账号。Worker / Vercel 的 env 是每次调用传进来的，只能在请求入口记一份。
+// 只缓存这两个键——它们就是全部运行时配置来源，且不含可变状态。
+let lastEnv = { CLINE_REFRESH_TOKEN: "", API_KEY: "" };
+
+function rememberEnv(env) {
+  if (!env) return;
+  lastEnv = { CLINE_REFRESH_TOKEN: env.CLINE_REFRESH_TOKEN || "", API_KEY: env.API_KEY || "" };
+}
+
+// 后台任务用的 env。没有请求上下文时（冷启动后第一个请求之前）返回上次记住的值。
+function ambientEnv() {
+  return lastEnv;
+}
+
 // 从环境变量解析账号池：CLINE_REFRESH_TOKEN 每行一个
 // ⚠️ 重建判据必须用「环境变量原文」比较，不能逐位比较池内 refreshToken：
 //    上游 /auth/refresh 会轮换 refreshToken，代码会把新 token 写回账号对象，
 //    此时池内 token != 环境变量 token，若按 token 比较会导致「每次请求都重建池」，
-//    连带把 accessToken 缓存和 cooldownUntil 冷却状态一起清空 →
+//    连带把 accessToken 缓存和冷却状态一起清空 →
 //    ① 每个请求都多打一次 /auth/refresh；② 冷却失效、429 时不切号空转重试。
 let accountsRawEnv = null;   // 上次解析用的环境变量原文
 let accountPoolDirty = false; // 运行时登录追加过账号，需要重建
 
 function parseAccounts(env) {
+  env = env || ambientEnv();
   const raw = env.CLINE_REFRESH_TOKEN || "";
   const tokens = raw.split("\n").map((s) => s.trim()).filter((s) => s.length > 8);
 
   // 环境变量里的账号 + 运行时通过控制台登录追加的账号
-  const dyn = dynamicAccounts.filter((d) => d && d.refreshToken && d.refreshToken.length > 8);
+  const dyn = runtimeState.dynamicAccounts.filter((d) => d && d.refreshToken && d.refreshToken.length > 8);
 
   if (tokens.length === 0 && dyn.length === 0) {
     accounts = [];
@@ -353,30 +900,40 @@ function parseAccounts(env) {
   }
 
   // 只有环境变量原文变化（增删/调整账号）或运行时追加过账号时才重建，
-  // 以保留 accessToken 缓存与 cooldownUntil 冷却状态。
+  // 以保留 accessToken 缓存与冷却状态。
+  //
+  // 账号身份按 originToken 匹配：上游刷新时会轮换 refreshToken，池内对象的
+  // refreshToken 会被换成新值，若按它比较，每次刷新都会认成"新账号"而重建，
+  // 连带丢掉 token 缓存与冷却。
+  const originOf = (d) => d.originToken || d.refreshToken;
   if (accountsRawEnv !== raw || accountPoolDirty || accounts.length !== tokens.length + dyn.length) {
     const old = accounts;
-    const build = (rt, prev) => {
-      if (prev && prev.originToken === rt) return prev;
+    const byOrigin = new Map();
+    for (const a of old) if (a && a.originToken) byOrigin.set(a.originToken, a);
+    const build = (rt, origin, prev) => {
+      if (prev && prev.originToken === origin) {
+        // 复用旧对象，但同步最新的 refreshToken（上游可能已轮换过）
+        prev.refreshToken = rt;
+        return prev;
+      }
       return {
         refreshToken: rt,
-        originToken: rt, // 用于判定账号身份（上游会轮换 refreshToken）
+        originToken: origin, // 用于判定账号身份（上游会轮换 refreshToken）
         accessToken: null,
         expiry: 0,
-        cooldownUntil: 0,
       };
     };
     const out = [];
-    for (let i = 0; i < tokens.length; i++) {
-      out.push(build(tokens[i], old[i]));
+    for (const t of tokens) {
+      out.push(build(t, t, byOrigin.get(t)));
     }
     // 运行时账号接在环境变量账号之后，同 token 不重复计入
-    for (let j = 0; j < dyn.length; j++) {
-      if (tokens.includes(dyn[j].refreshToken)) continue;
-      const prev = old[tokens.length + j];
-      const acct = build(dyn[j].refreshToken, prev);
-      acct.email = dyn[j].email || "";
-      acct.runtime = true; // 标记为运行时账号（重启会丢）
+    for (const d of dyn) {
+      if (tokens.includes(d.refreshToken)) continue;
+      const origin = originOf(d);
+      const acct = build(d.refreshToken, origin, byOrigin.get(origin));
+      acct.email = d.email || "";
+      acct.runtime = true;
       out.push(acct);
     }
     accounts = out;
@@ -389,7 +946,7 @@ function parseAccounts(env) {
 // ---------------------------------------------------------------------------
 // 账号控制（控制台用）
 //
-// 三种控制能力，都只作用于当前实例内存（重启即恢复环境变量原状）：
+// 三种控制能力：
 //   enabled=false  停用：跳过轮询但保留在池里，随时可再启用
 //   reset          清冷却与 token 缓存，让它立刻可以被再次尝试
 //   remove         移除运行时登录的账号。环境变量账号只能停用 —— 移除没有意义，
@@ -399,7 +956,10 @@ function parseAccounts(env) {
 // 用 originToken 而非 refreshToken，是因为上游刷新时会轮换 refreshToken，
 // 若用后者，账号每刷新一次 id 就变，控制台的开关会"跟丢"账号。
 // ---------------------------------------------------------------------------
-let disabledIds = new Set();
+function disabledSet() {
+  if (!Array.isArray(runtimeState.disabledIds)) runtimeState.disabledIds = [];
+  return runtimeState.disabledIds;
+}
 
 function accountId(acct) {
   const src = acct.originToken || acct.refreshToken || "";
@@ -415,9 +975,10 @@ function accountId(acct) {
 // 解析并为每个账号补上 id / enabled（含已停用的账号，供控制台展示）
 function listAccounts(env) {
   const pool = parseAccounts(env);
+  const disabled = disabledSet();
   for (const a of pool) {
     if (!a.id) a.id = accountId(a);
-    a.enabled = !disabledIds.has(a.id);
+    a.enabled = !disabled.includes(a.id);
   }
   // 账号对象每次重建时 usage 是空的，从全局按 id 回填，保证重启后账号卡上的
   // token 数不归零（byAccount 可以从磁盘恢复，账号对象则不行）
@@ -438,12 +999,31 @@ function accountSummaries(env) {
     index: i,
     id: a.id,
     enabled: a.enabled,
-    // 停用的账号不算"可用"：它不会参与轮询，界面上也不该显示成可用
-    available: a.enabled && (!a.cooldownUntil || a.cooldownUntil <= now),
-    cooldown_seconds: a.cooldownUntil > now ? Math.ceil((a.cooldownUntil - now) / 1000) : 0,
-    cooldown_reason: a.cooldownReason || null,
+    // 停用的账号不算"可用"：它不会参与轮询，界面上也不该显示成可用。
+    // 冷却改成「账号×模型」级后，这里只表示「账号本身是否可参与调度」——
+    // 具体哪个模型在冷却要看 cooldown_models。
+    available: a.enabled,
+    cooldown_models: cooldownSnapshot(a.id).map((c) => ({
+      model_id: c.model_id,
+      remaining_seconds: c.remaining_seconds,
+      kind: c.kind,
+      limited: c.limited,
+      detail: c.detail,
+      resets_at: c.resets_at,
+    })),
+    cooldown_seconds: (() => {
+      const list = cooldownSnapshot(a.id);
+      return list.length ? Math.max(...list.map((c) => c.remaining_seconds)) : 0;
+    })(),
+    cooldown_reason: (() => {
+      const list = cooldownSnapshot(a.id);
+      if (!list.length) return null;
+      // 展示优先级：明确的「额度用尽」比猜测的未知原因更值得说
+      return list.find((c) => c.limited) ? "limit" : "unknown";
+    })(),
     token_cached: !!(a.accessToken && now < a.expiry),
-    // 运行时登录的账号在重启后会消失，控制台需要据此提示用户去存环境变量
+    // 控制台登录的账号在云端重启后会消失，界面要据此提示存环境变量；
+    // 本地运行时已由 local-server.js 落盘，重启不丢。
     runtime: !!a.runtime,
     email: a.email || "",
     stats: {
@@ -747,6 +1327,1015 @@ function usageSummary() {
   };
 }
 
+// ===========================================================================
+// 运行时设置（控制台可改）
+//
+// 云端（Workers / Vercel）没有可写磁盘，所以这份状态主体活在内存里；本地运行时
+// 由 local-server.js 通过下面这组钩子落盘，重启不丢（与 token 用量统计同一套模式）。
+//
+// 为什么要它：冷却时长、轮换策略、请求头、上游渠道钉住、system prompt 覆盖这些
+// 都需要「改了就能用」，而不是改环境变量再重新部署。
+// ===========================================================================
+
+const STATE_VERSION = 1;
+
+function defaultRuntimeState() {
+  return {
+    version: STATE_VERSION,
+    // 轮换策略：round_robin 轮询 / fill 先用满一个号再换 / random 随机
+    strategy: "round_robin",
+    // 自定义请求头（覆盖内置 Cline 指纹头里同名的那些）
+    headers: {},
+    headersComplete: false,
+    // 默认模型。空 = 用已启用列表的第一个
+    defaultModel: "",
+    // 「账号×模型」级 429 冷却的兜底时长（分钟）。上游给出重置时间时以它为准。
+    cooldownMinutes: 30,
+    // system prompt 覆盖：非空时替换客户端传来的 system 消息
+    overridePrompt: "",
+    // 「已启用模型」列表（控制台模型页里加进来的）。
+    //
+    // ⚠️ 这是**发现过滤器**，不是访问控制：/v1/models 只回这里的模型，
+    // 但 chat 端点不校验——客户端写死一个不在列表里的模型 ID 仍然能用。
+    // 这样设计是有意的：面板的作用是「别让客户端看到四百多个挑不过来的模型」，
+    // 而不是给 API 加一道会误伤人的门（写死 ID 的客户端不该因为没在面板点过而失败）。
+    models: [],
+    // 按模型配置上游渠道（见下方「上游渠道钉住」）。key = 模型 ID
+    perModel: {},
+    // 控制台登录的账号。落盘后重启不丢（含上游轮换过的最新 refreshToken）。
+    dynamicAccounts: [],
+    // 被停用的账号 id
+    disabledIds: [],
+  };
+}
+
+let runtimeState = defaultRuntimeState();
+let statePersistCb = null;
+let stateFlushTimer = null;
+const STATE_FLUSH_MS = 800;   // 落盘防抖：改设置时连续点几下只写一次
+
+function exportState() {
+  return JSON.parse(JSON.stringify(runtimeState));
+}
+
+function scheduleStateFlush() {
+  if (!statePersistCb || stateFlushTimer) return;
+  stateFlushTimer = setTimeout(() => {
+    stateFlushTimer = null;
+    try { statePersistCb(exportState()); } catch (e) { /* 落盘失败不影响服务 */ }
+  }, STATE_FLUSH_MS);
+  if (stateFlushTimer && typeof stateFlushTimer.unref === "function") stateFlushTimer.unref();
+}
+
+function flushStateNow() {
+  if (stateFlushTimer) { clearTimeout(stateFlushTimer); stateFlushTimer = null; }
+  if (!statePersistCb) return false;
+  try { statePersistCb(exportState()); return true; } catch (e) { return false; }
+}
+
+function setStatePersistence(fn) {
+  statePersistCb = fn;
+  return true;
+}
+
+// 装回上次的设置。只认识自己版本的结构，字段逐个校验后再采用——
+// 手工编辑过的文件不该让服务起不来（坏字段退回默认值即可）。
+function restoreState(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  const next = defaultRuntimeState();
+  if (["round_robin", "fill", "random"].includes(snap.strategy)) next.strategy = snap.strategy;
+  if (snap.headers && typeof snap.headers === "object") {
+    for (const [k, v] of Object.entries(snap.headers)) {
+      if (typeof k === "string" && k.trim() && typeof v === "string") next.headers[k] = v;
+    }
+  }
+  next.headersComplete = !!snap.headersComplete;
+  if (typeof snap.defaultModel === "string") next.defaultModel = snap.defaultModel.trim();
+  // 已启用模型：逐条校验后再采用（手改坏一条不该让整个列表作废，只跳过那一条）
+  if (Array.isArray(snap.models)) {
+    const seen = new Set();
+    for (const raw of snap.models) {
+      const id = normalizeExistingModelId(raw);
+      if (!id || id.length > MAX_MODEL_ID_LENGTH || seen.has(id)) continue;
+      seen.add(id);
+      next.models.push(id);
+    }
+  }
+  // 默认模型必须仍在启用列表里，否则清空让它回退到列表第一个
+  if (next.defaultModel && !next.models.some((m) => normalizeExistingModelId(m) === normalizeExistingModelId(next.defaultModel))) {
+    next.defaultModel = "";
+  }
+  const cm = Number(snap.cooldownMinutes);
+  if (Number.isFinite(cm) && cm > 0 && cm <= 1440) next.cooldownMinutes = Math.round(cm);
+  if (typeof snap.overridePrompt === "string") next.overridePrompt = snap.overridePrompt;
+  if (snap.perModel && typeof snap.perModel === "object") {
+    for (const [k, v] of Object.entries(snap.perModel)) {
+      const clean = sanitizeUpstreamConfig(v);
+      if (clean) next.perModel[k] = clean;
+    }
+  }
+  if (Array.isArray(snap.dynamicAccounts)) {
+    for (const a of snap.dynamicAccounts) {
+      if (!a || typeof a.refreshToken !== "string" || a.refreshToken.trim().length <= 8) continue;
+      next.dynamicAccounts.push({
+        refreshToken: a.refreshToken.trim(),
+        originToken: (typeof a.originToken === "string" && a.originToken.trim()) || a.refreshToken.trim(),
+        email: typeof a.email === "string" ? a.email : "",
+      });
+    }
+  }
+  if (Array.isArray(snap.disabledIds)) {
+    next.disabledIds = snap.disabledIds.filter((s) => typeof s === "string");
+  }
+  runtimeState = next;
+  accountPoolDirty = true;   // 账号池按新状态重建
+  return true;
+}
+
+globalThis.__clineState = { setStatePersistence, restoreState, exportState, flushStateNow };
+
+function cooldownMinutes() {
+  const m = Number(runtimeState.cooldownMinutes);
+  return Number.isFinite(m) && m > 0 ? m : 30;
+}
+
+// defaultModelId 定义在「模型库」一节（它依赖启用列表，属于那一层的职责）
+
+// ---------------------------------------------------------------------------
+// 「账号 × 模型」级冷却
+//
+// 上游按「账号 + 模型」组合独立计额：某账号的 deepseek 额度用尽，不代表同账号的
+// glm 也不能用。所以冷却必须落在组合粒度上——旧实现把整个账号标成冷却并踢出轮询，
+// 模型 A 到上限会让同账号的模型 B 一起不可用。
+//
+// 刻意不持久化：重启往往意味着运维干预，让全部账号重新回到轮询比带着旧状态继续
+// 更符合预期，也避免「永不下线」那类坑。
+// ---------------------------------------------------------------------------
+const MAX_COOLDOWN_RECORDS = 2000;
+const cooldowns = new Map();   // "accId|modelId" -> { until, email, kind, detail, resetsAt }
+
+function cooldownKey(accountId, modelId) {
+  return accountId + "|" + modelId;
+}
+
+function pruneCooldowns(now) {
+  for (const [key, rec] of cooldowns) {
+    if (rec.until <= now) cooldowns.delete(key);
+  }
+}
+
+// 标记冷却。账号或模型为空时跳过：组合级冷却需要一个确定的模型标识，
+// 否则会写进一个永远查不到的 key，静默失效。
+function markCooldown(accountId, email, modelId, ttlMs, info) {
+  if (!accountId || !modelId || !(ttlMs > 0)) return;
+  const now = Date.now();
+  if (cooldowns.size >= MAX_COOLDOWN_RECORDS) {
+    pruneCooldowns(now);
+    if (cooldowns.size >= MAX_COOLDOWN_RECORDS) return; // 宁可少一条展示数据也不无限增长
+  }
+  cooldowns.set(cooldownKey(accountId, modelId), {
+    until: now + ttlMs,
+    email: email || "",
+    kind: (info && info.kind) || "unknown",
+    detail: (info && info.detail) || "",
+    resetsAt: (info && info.resetsAt) || 0,
+  });
+}
+
+function isCooling(accountId, modelId, now) {
+  const rec = cooldowns.get(cooldownKey(accountId, modelId));
+  if (!rec) return false;
+  if (rec.until > (now || Date.now())) return true;
+  cooldowns.delete(cooldownKey(accountId, modelId));
+  return false;
+}
+
+function clearCooldownModel(accountId, modelId) {
+  return cooldowns.delete(cooldownKey(accountId, modelId));
+}
+
+function clearCooldownAccount(accountId) {
+  let n = 0;
+  for (const key of [...cooldowns.keys()]) {
+    if (key.startsWith(accountId + "|")) { cooldowns.delete(key); n++; }
+  }
+  return n;
+}
+
+function clearAllCooldowns() {
+  const n = cooldowns.size;
+  cooldowns.clear();
+  return n;
+}
+
+// 冷却快照，按恢复时间升序（控制台与账号详情共用）
+function cooldownSnapshot(accountId) {
+  const now = Date.now();
+  const out = [];
+  for (const [key, rec] of cooldowns) {
+    if (rec.until <= now) { cooldowns.delete(key); continue; }
+    const i = key.indexOf("|");
+    if (i < 0) continue;
+    const accId = key.slice(0, i), modelId = key.slice(i + 1);
+    if (accountId && accId !== accountId) continue;
+    out.push({
+      account_id: accId,
+      email: rec.email,
+      model_id: modelId,
+      until: rec.until,
+      remaining_seconds: Math.ceil((rec.until - now) / 1000),
+      // 上游明确告知是「额度用尽」时才为 true；unknown 是我们按配置时长猜的，
+      // 两者在界面上要区分开，不能把猜测当事实。
+      limited: rec.kind !== "unknown" && rec.kind !== "",
+      kind: rec.kind,
+      detail: rec.detail,
+      resets_at: rec.resetsAt || 0,
+    });
+  }
+  out.sort((a, b) => (a.until - b.until) || a.account_id.localeCompare(b.account_id) || a.model_id.localeCompare(b.model_id));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// 上游限流（429）解析
+//
+// 上游按「账号×模型」限流，且不同额度的重置规律完全不同：
+//   免费模型   按自然日 → 重置在次日本地零点
+//   ClinePass  订阅额度 → 上游只说 "please try again later."，没有固定周期
+//   花费上限   带 resets_at 时间戳 → 用上游给的时刻
+// 用一个固定时长兜底还行，但**早于真实重置把请求放回去**只会立刻再撞一次 429，
+// 白烧一次额度，所以能解析出真实重置时刻时必须用它。
+//
+// 标记字符串取自 Cline 官方客户端源码（sdk/packages/llms/src/providers/errors.ts）。
+// 上游改文案时这里会退化成 unknown，但不会误报「额度用尽」。
+// ---------------------------------------------------------------------------
+const LIMIT_MARKER_FREE = "free limit reached on model";
+const LIMIT_MARKER_RETRY_IN = "try again in ";
+const LIMIT_MARKER_PASS = "clinepass limit";
+const LIMIT_MARKER_SPEND = "spend_limit_exceeded";
+const MAX_LIMIT_DETAIL = 300;
+// 解析出的重置时间能生效的上限：防止上游给出荒唐值（或解析出错）把组合锁死很久。
+// 免费模型的每日额度最长也就到明天零点，24 小时足够覆盖。
+const MAX_PARSED_COOLDOWN_MS = 24 * 3600 * 1000;
+
+// 上游的 "try again in X" 支持 1h30m 缩写，也支持 "2 hours 30 minutes" 单词写法。
+// 只认 h/m/s 单字母会把 "2 hours" 解析成 2h 而丢掉后面的分钟，所以单词形态必须一起认。
+const RETRY_UNIT_RE = /(\d+)\s*(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b/g;
+const JSON_TIME_RE = /"resets_at"\s*:\s*"([^"]+)"/;
+
+function parseRetryAfter(text) {
+  const idx = text.indexOf(LIMIT_MARKER_RETRY_IN);
+  if (idx < 0) return 0;
+  // 只在这一小段里找，避免把后面的其它数字（如错误码）当成时长
+  const tail = text.slice(idx + LIMIT_MARKER_RETRY_IN.length, idx + LIMIT_MARKER_RETRY_IN.length + 80);
+  let total = 0;
+  RETRY_UNIT_RE.lastIndex = 0;
+  let m;
+  while ((m = RETRY_UNIT_RE.exec(tail)) !== null) {
+    const n = parseInt(m[1], 10);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    const unit = m[2];
+    if (unit.startsWith("h")) total += n * 3600 * 1000;
+    else if (unit.startsWith("m")) total += n * 60 * 1000;
+    else total += n * 1000;
+  }
+  return total > 0 ? total : 0;
+}
+
+// 下一次本地零点（免费模型每日额度的重置时刻）。
+// 用本地时间而非 UTC：额度按用户的自然日重置，界面上的「今天」要和他自己的日历一致。
+function nextLocalMidnight(nowMs) {
+  const d = new Date(nowMs);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+}
+
+// 从 429 响应体解析额度信息。纯字符串处理，不依赖 body 是合法 JSON
+// （可能是纯文本、被截断的片段），解析失败不影响冷却本身。
+function parseLimitInfo(bodyText, nowMs) {
+  const raw = String(bodyText || "");
+  const detail = raw.length > MAX_LIMIT_DETAIL ? raw.slice(0, MAX_LIMIT_DETAIL) + "..." : raw;
+  const info = { kind: "unknown", detail, resetsAt: 0, resetInMs: 0 };
+  if (!detail.trim()) return info;
+  const lower = detail.toLowerCase();
+
+  if (lower.includes(LIMIT_MARKER_FREE)) {
+    info.kind = "free_daily";
+    const d = parseRetryAfter(lower);
+    if (d > 0) info.resetInMs = d;
+    else info.resetsAt = nextLocalMidnight(nowMs);
+  } else if (lower.includes(LIMIT_MARKER_PASS)) {
+    info.kind = "pass_limit";
+    const d = parseRetryAfter(lower);
+    if (d > 0) info.resetInMs = d;
+  } else if (lower.includes(LIMIT_MARKER_SPEND) || lower.includes("spend limit")) {
+    info.kind = "spend_limit";
+    // resets_at 是上游给的绝对时刻，优先于文字里的相对时长
+    const m = detail.match(JSON_TIME_RE);
+    const ts = m ? Date.parse(m[1]) : NaN;
+    if (Number.isFinite(ts)) info.resetsAt = ts;
+    else {
+      const d = parseRetryAfter(lower);
+      if (d > 0) info.resetInMs = d;
+    }
+  }
+
+  // 上游给的重置时间必须落在合理区间，否则丢弃（退回按配置时长冷却）
+  if (info.resetsAt) {
+    const delta = info.resetsAt - nowMs;
+    if (delta <= 0 || delta > MAX_PARSED_COOLDOWN_MS) info.resetsAt = 0;
+  }
+  if (info.resetInMs > MAX_PARSED_COOLDOWN_MS) info.resetInMs = MAX_PARSED_COOLDOWN_MS;
+  return info;
+}
+
+// 计算本次冷却时长并标记，返回实际使用的时长（供日志）。
+// 上游明确给出重置时刻/时长时用它，否则用配置里的兜底值。
+function applyCooldown(acc, modelId, bodyText, nowMs) {
+  const info = parseLimitInfo(bodyText, nowMs);
+  let ttl = info.resetInMs || (info.resetsAt ? Math.max(info.resetsAt - nowMs, 0) : 0);
+  if (!(ttl > 0)) ttl = cooldownMinutes() * 60 * 1000;
+  if (ttl > MAX_PARSED_COOLDOWN_MS) ttl = MAX_PARSED_COOLDOWN_MS;
+  markCooldown(accountId(acc), acc && acc.email, modelId, ttl, info);
+  return { ttl, info };
+}
+
+function formatResetAt(ts) {
+  if (!ts) return "unknown";
+  const d = new Date(ts);
+  const p = (n) => (n < 10 ? "0" : "") + n;
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) + " " +
+         p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+}
+
+// ---------------------------------------------------------------------------
+// 上游渠道钉住（upstream pinning）
+//
+// 背景：Cline 网关后面是两条完全不同的路由管道，钉住上游的写法互不通用——
+//
+//   direct（OpenRouter）：响应顶层带 provider（显示名）与 model（真实上游 ID），
+//       钉住写进顶层 provider.{only,order}。
+//   planner（Vercel AI Gateway）：响应带 provider_metadata.gateway.routing，
+//       顶层 provider.* 会被 Cline 丢弃，必须写 providerOptions.gateway.{only,order}。
+//
+// 管道归属不是固定的：同一个模型在不同时间可能落在这两条之一，所以只能运行时
+// 探测 + 缓存，不能硬编码名单。
+//
+// 「是否免费」与管道无关，因此这里不按 cost 分支。
+// ---------------------------------------------------------------------------
+const PIPELINE_DIRECT = "direct";
+const PIPELINE_PLANNER = "planner";
+// 探测用的假上游名。故意带一个不存在的渠道，让网关在**路由层**报错并列出可用
+// 渠道清单；若网关忽略筛选，仍可能生成回答并消耗 token。
+const PROBE_SENTINEL = "__probe__";
+// 探测请求的 max_tokens。刻意不传 reasoning_effort：推理模型的思考过程会先用掉
+// 预算，小 max_tokens 下模型还没输出正文就被截断，上游回 500「empty response
+// content」，会把「渠道坏了」误判出来。所以探测一律用足够大的预算且不带 effort。
+const PROBE_MAX_TOKENS = 512;
+
+const UPSTREAM_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+// 渠道 slug 形态校验，挡住把任意字符串注入请求体的可能
+function validUpstreamSlug(s) {
+  return typeof s === "string" && s.length > 0 && s.length <= 64 && UPSTREAM_SLUG_RE.test(s);
+}
+
+// 渠道名归一化：只保留小写字母与数字。
+// 必要性来自实测：direct 管道回的 provider 是**显示名**（"DeepInfra"、"Upstage"），
+// 而探出来的 slug 是 "deepinfra"、"upstage"。不归一化就无法判断「钉住的渠道」与
+// 「实际命中的渠道」是否同一个。
+function normalizeProviderSlug(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// 清洗一组渠道名：去空白、跳过非法项、去重（保序）
+function sanitizeUpstreams(list) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of Array.isArray(list) ? list : []) {
+    const s = String(raw || "").trim();
+    if (!validUpstreamSlug(s) || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  return out;
+}
+
+// 清洗一条模型上游配置（来自控制台或落盘文件）。返回 null 表示这条没有有效内容。
+function sanitizeUpstreamConfig(cfg) {
+  if (!cfg || typeof cfg !== "object") return null;
+  const out = {
+    upstreams: sanitizeUpstreams(cfg.upstreams),
+    exclude: sanitizeUpstreams(cfg.exclude),
+    pinMode: String(cfg.pinMode || "").toLowerCase() === "preferred" ? "preferred" : "strict",
+    redirect: typeof cfg.redirect === "string" ? cfg.redirect.trim() : "",
+    aliases: sanitizeUpstreams([]),   // 别名允许含 "/"，不能用 slug 规则，见下
+    pipeline: [PIPELINE_DIRECT, PIPELINE_PLANNER].includes(cfg.pipeline) ? cfg.pipeline : "",
+    available: sanitizeUpstreams(cfg.available),
+    observed: sanitizeUpstreams(cfg.observed),
+    lastProvider: typeof cfg.lastProvider === "string" ? cfg.lastProvider : "",
+    probedAt: Number(cfg.probedAt) || 0,
+    updatedAt: Number(cfg.updatedAt) || 0,
+  };
+  // 别名是模型 ID（含 "/"），slug 规则会把它们全部过滤掉，所以单独清洗
+  if (Array.isArray(cfg.aliases)) {
+    const seen = new Set();
+    for (const raw of cfg.aliases) {
+      const s = String(raw || "").trim();
+      if (!s || s.length > 128 || seen.has(s)) continue;
+      seen.add(s);
+      out.aliases.push(s);
+    }
+  }
+  if (!out.upstreams.length && !out.exclude.length && !out.redirect && !out.aliases.length &&
+      !out.pipeline && !out.available.length) {
+    return null;
+  }
+  return out;
+}
+
+// 找 modelID 对应的上游配置。modelID 可能是某条记录的别名，所以要扫一遍别名。
+function lookupModelUpstream(modelId) {
+  if (!modelId) return null;
+  const direct = runtimeState.perModel[modelId];
+  if (direct) return direct;
+  // 别名扫描按 key 排序，保证同一次输入总是得到同一个结果
+  for (const key of Object.keys(runtimeState.perModel).sort()) {
+    const cfg = runtimeState.perModel[key];
+    if (cfg && Array.isArray(cfg.aliases) && cfg.aliases.includes(modelId)) return cfg;
+  }
+  return null;
+}
+
+// 把对外模型 ID 解析成真正发给上游的模型 ID（应用重定向）
+function upstreamModelId(modelId) {
+  const cfg = lookupModelUpstream(modelId);
+  return cfg && cfg.redirect ? cfg.redirect : modelId;
+}
+
+// 把一条配置换算成网关认识的偏好键。返回 null 表示不需要注入任何东西。
+function buildUpstreamPrefs(cfg) {
+  const excluded = new Set(cfg.exclude || []);
+  // 钉住列表里剔除被排除的渠道：排除的优先级高于勾选
+  const pinned = (cfg.upstreams || []).filter((u) => !excluded.has(u));
+  // 排除换算成 only 白名单，需要已知渠道清单（来自探测缓存）。
+  // 网关不支持 exclude/ignore 字段（实测被静默忽略），所以只能这样换算。
+  const allowList = (cfg.exclude || []).length && (cfg.available || []).length
+    ? (cfg.available || []).filter((u) => !excluded.has(u))
+    : [];
+
+  if (pinned.length && cfg.pinMode === "preferred") {
+    const prefs = { order: pinned };
+    // preferred 模式也要限制回退范围，否则网关可能回退到被排除的渠道
+    if (allowList.length) prefs.only = allowList;
+    return prefs;
+  }
+  if (pinned.length) return { only: pinned };
+  if (allowList.length) return { only: allowList };
+  return null;
+}
+
+// 就地把上游偏好与模型重定向写进已构造好的请求体。
+//
+// 管道未知时两种形式**同时**注入：实测在 planner 模型上额外加一个顶层 provider.only
+// 不会报错、也不会干扰 providerOptions.gateway（顶层被网关忽略），所以这是安全的
+// 兜底，省掉了「必须先探测成功才能钉住」的强依赖。
+//
+// 用「整体替换」而不是与已有内容合并：客户端也可能自己传 providerOptions，合并会让
+// 它的其它键（例如 sort）存活下来并一起发往上游——实测 gateway.sort 会让上游直接
+// 500，等于把客户端的错误参数放大成一次失败请求。面板配置存在时这一块由面板说了算。
+function applyUpstreamPrefs(body, modelId) {
+  const cfg = lookupModelUpstream(modelId);
+  if (!cfg) return;
+  if (cfg.redirect) body.model = cfg.redirect;
+  const prefs = buildUpstreamPrefs(cfg);
+  if (!prefs) return;
+  const usePlanner = cfg.pipeline === PIPELINE_PLANNER || cfg.pipeline === "";
+  const useDirect = cfg.pipeline === PIPELINE_DIRECT || cfg.pipeline === "";
+  if (usePlanner) {
+    const po = (body.providerOptions && typeof body.providerOptions === "object") ? body.providerOptions : {};
+    po.gateway = prefs;
+    body.providerOptions = po;
+  }
+  if (useDirect) body.provider = prefs;
+}
+
+// ---------------------------------------------------------------------------
+// 上游探测：判定管道归属 + 枚举可用渠道
+// ---------------------------------------------------------------------------
+
+// unwrapUpstream 把上游的 {"data":{...}} 包装拆掉，返回真正含 choices 的那层
+function unwrapUpstream(obj) {
+  if (obj && typeof obj === "object" && obj.data && typeof obj.data === "object" && obj.data.choices) return obj.data;
+  return obj;
+}
+
+// 沿路径取嵌套对象，任一层缺失就返回 null
+function nestedMap(obj, path) {
+  let cur = obj;
+  for (const key of path) {
+    if (!cur || typeof cur !== "object") return null;
+    cur = cur[key];
+  }
+  return (cur && typeof cur === "object") ? cur : null;
+}
+
+function firstChoice(obj) {
+  const d = unwrapUpstream(obj);
+  if (!d || !Array.isArray(d.choices) || !d.choices.length) return null;
+  return d.choices[0] && typeof d.choices[0] === "object" ? d.choices[0] : null;
+}
+
+function stringArray(v) {
+  if (!Array.isArray(v)) return [];
+  return v.filter((x) => typeof x === "string");
+}
+
+// 从响应体里回读管道归属与实际上游。
+// 非流式元数据在 choices[0].message.provider_metadata，流式在 choices[0].delta 下，
+// 两者都认，所以同一个函数既能解析探测响应也能解析流式分片。
+function parseUpstreamRouting(obj) {
+  const d = unwrapUpstream(obj);
+  const out = { pipeline: "", provider: "", canonicalSlug: "", fallbacks: [], plan: "" };
+  if (!d || typeof d !== "object") return out;
+
+  let routing = null;
+  const choice = firstChoice(d);
+  if (choice) {
+    if (choice.message && typeof choice.message === "object") {
+      routing = nestedMap(choice.message.provider_metadata, ["gateway", "routing"]);
+    }
+    if (!routing && choice.delta && typeof choice.delta === "object") {
+      routing = nestedMap(choice.delta.provider_metadata, ["gateway", "routing"]);
+    }
+  }
+  if (!routing) routing = nestedMap(d.provider_metadata, ["gateway", "routing"]);
+
+  if (routing) {
+    if (typeof routing.finalProvider === "string") {
+      out.pipeline = PIPELINE_PLANNER;
+      out.provider = routing.finalProvider;
+    }
+    if (typeof routing.canonicalSlug === "string") out.canonicalSlug = routing.canonicalSlug;
+    if (typeof routing.planningReasoning === "string") out.plan = routing.planningReasoning;
+    out.fallbacks = stringArray(routing.fallbacksAvailable);
+  }
+
+  // direct 管道没有 routing，改看顶层 provider（显示名）与 model（真实上游 ID）
+  if (typeof d.provider === "string" && d.provider) {
+    if (!out.pipeline) {
+      out.pipeline = PIPELINE_DIRECT;
+      out.provider = d.provider;
+    }
+  }
+  if (!out.canonicalSlug && typeof d.model === "string" && d.model.includes("/")) {
+    out.canonicalSlug = d.model;
+  }
+  return out;
+}
+
+// 从假上游探测的**错误响应**里抽出渠道清单。
+// 两条管道的错误形态不同，因此先按管道解析，再退回到通用正则。
+function parseAvailableProviders(obj, pipeline) {
+  let errText = "";
+  if (obj && typeof obj === "object" && obj.error !== undefined) {
+    const e = obj.error;
+    if (typeof e === "string") errText = e;
+    else if (e && typeof e === "object") {
+      const list = extractProviderList(e);
+      if (list.length) return list;
+      if (typeof e.message === "string") errText = e.message;
+    }
+  }
+  // 优先：错误文本里嵌的 JSON 片段
+  const brace = errText.indexOf("{");
+  if (brace >= 0) {
+    try {
+      const embedded = JSON.parse(errText.slice(brace));
+      const list = extractProviderList(embedded);
+      if (list.length) return list;
+    } catch (e) { /* 不是 JSON，继续走文本解析 */ }
+  }
+  // 兜底：两条管道各自的文本形态都试一遍
+  for (const re of [PROVIDER_LIST_RE_PLANNER, PROVIDER_LIST_RE_DIRECT]) {
+    const list = splitProviderTokens(re, errText);
+    if (list.length) return list;
+  }
+  return [];
+}
+
+// 边界刻意写成「slug 的逗号列表」而不是更省事的 [^.]+：错误文本尾部通常还跟着
+// JSON 残片（wafer","type":"invalid_request_error"...），用 [^.]+ 会把它们一起吃
+// 进去，结果最后一个渠道名被污染后过滤掉——实测表现为「渠道数偶尔少一个」。
+const PROVIDER_LIST_RE_DIRECT = /Providers serving [^:]+:\s*([a-z0-9][a-z0-9-]*(?:\s*,\s*[a-z0-9][a-z0-9-]*)*)/;
+const PROVIDER_LIST_RE_PLANNER = /Available providers are:\s*([a-z0-9][a-z0-9-]*(?:\s*,\s*[a-z0-9][a-z0-9-]*)*)/;
+
+// 在任意嵌套结构里找 available_providers 数组
+function extractProviderList(obj) {
+  if (!obj || typeof obj !== "object") return [];
+  const fromMeta = (m) => {
+    if (!m || typeof m !== "object") return [];
+    const list = stringArray(m.available_providers);
+    return list.length ? sanitizeUpstreams(list) : [];
+  };
+  if (obj.error && typeof obj.error === "object") {
+    const l = fromMeta(obj.error.metadata);
+    if (l.length) return l;
+  }
+  return fromMeta(obj.metadata);
+}
+
+// 用正则抓一段再用 slug 形态过滤。过滤是必需的：错误文本里可能混有 JSON 残片
+// （如 ","type":"invalid_request_error"），不过滤会把它们当成渠道名。
+function splitProviderTokens(re, text) {
+  if (!text) return [];
+  const m = String(text).match(re);
+  if (!m) return [];
+  return sanitizeUpstreams(m[1].split(",").map((t) => t.trim().replace(/^["']|["']$/g, ""))).sort();
+}
+
+function appendProbeNote(result, note) {
+  if (!note) return;
+  // 用追加而非覆盖：探测是多步的，直接赋值会让后一步悄悄盖掉前一步的结论
+  // （比如把「钉住未生效」盖成「渠道清单解析失败」）。
+  result.note = result.note ? result.note + "；" + note : note;
+}
+
+// planner 响应元数据里的候选渠道。刻意与 Available 分开：观察到某个渠道
+// 不代表它能被严格钉住，因此不能拿它做排除项的白名单换算。
+function observedProviders(routing) {
+  if (routing.pipeline !== PIPELINE_PLANNER) return [];
+  return sanitizeUpstreams([routing.provider, ...routing.fallbacks]);
+}
+
+function probeRequestBody(modelId, maxTokens) {
+  return {
+    model: modelId,
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: maxTokens,
+    session_id: "sess_" + Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 异步探测任务
+//
+// 探测要打两次上游、耗时可能几十秒，同步返回会让页面转圈到超时。改成「立即返回
+// jobId，前端轮询状态」：也顺带让「连点两下同一个模型」共享同一次探测，不重复
+// 消耗额度。
+// ---------------------------------------------------------------------------
+const PROBE_JOB_TIMEOUT_MS = 5 * 60 * 1000;
+const PROBE_JOB_RETENTION_MS = 15 * 60 * 1000;
+const MAX_PROBE_JOBS = 32;
+const MAX_RUNNING_PROBES = 4;
+const probeJobs = new Map();   // jobId -> { id, modelId, status, result, error, createdAt }
+
+function pruneProbeJobs(now) {
+  for (const [id, job] of probeJobs) {
+    if (job.status !== "running" && now - job.createdAt > PROBE_JOB_RETENTION_MS) probeJobs.delete(id);
+  }
+}
+
+// kind 用于把「渠道探测」与「可用性检测」两套任务分开去重：
+// 同一个模型的两个动作是同名但不同的事，不该互相共享结果。
+function startProbeJob(modelId, run, kind) {
+  const taskKind = kind || "probe";
+  const now = Date.now();
+  pruneProbeJobs(now);
+  let running = 0;
+  for (const job of probeJobs.values()) {
+    if (job.status !== "running") continue;
+    // 同一模型 + 同类任务重复点击：共享正在跑的那个任务，不重复消耗额度
+    if (job.modelId === modelId && job.kind === taskKind) return { job, shared: true };
+    running++;
+  }
+  if (running >= MAX_RUNNING_PROBES) return { error: "任务较多，请稍后重试", status: 429 };
+  if (probeJobs.size >= MAX_PROBE_JOBS) {
+    let oldest = null;
+    for (const job of probeJobs.values()) {
+      if (job.status !== "running" && (!oldest || job.createdAt < oldest.createdAt)) oldest = job;
+    }
+    if (!oldest) return { error: "任务较多，请稍后重试", status: 429 };
+    probeJobs.delete(oldest.id);
+  }
+  const id = "job_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const job = { id, modelId, kind: taskKind, status: "running", result: null, error: null, createdAt: Date.now() };
+  probeJobs.set(id, job);
+  // 故意不 await：任务是后台跑的，前端按 jobId 轮询结果
+  runProbeJob(id, modelId, run, taskKind);
+  return { job, shared: false };
+}
+
+async function runProbeJob(id, modelId, run, kind) {
+  const taskKind = kind || "probe";
+  const runner = run || probeModelUpstreams;
+  try {
+    const result = await withTimeout(runner(modelId), PROBE_JOB_TIMEOUT_MS);
+    const job = probeJobs.get(id);
+    if (!job) return;
+    job.status = "done";
+    job.result = result;
+    // 只有渠道探测的结果要写回配置缓存（管道归属 + 渠道清单）；
+    // 可用性检测不碰配置——它只回答"现在能不能用"，不该顺带改状态。
+    if (taskKind === "probe") {
+      saveProbeResult(modelId, result);
+      scheduleStateFlush();
+    }
+  } catch (e) {
+    const job = probeJobs.get(id);
+    if (!job) return;
+    job.status = "failed";
+    job.error = (e && e.message === "probe_timeout")
+      ? "上游响应超时，请稍后重试"
+      : String((e && e.message) || e);
+  }
+}
+
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("probe_timeout")), ms);
+    promise.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); }
+    );
+  });
+}
+
+// 探测一个模型的管道归属与可用渠道清单。共两步：
+//  1. 发一次**带上当前钉住配置**的真实请求（有配置就注入，没有就是自动模式），
+//     既回读管道归属，也顺带回答「我钉的渠道到底生效了没有」。
+//  2. 带假上游名让网关在**路由层**报错并列出渠道清单。
+//
+// 第 1 步必须真的注入钉住配置：否则「实际命中的渠道」与「用户钉的渠道」无关，
+// providerMatch 只表示实际命中与配置一致，不能单独证明网关执行了筛选。
+async function probeModelUpstreams(modelId) {
+  const upstreamModel = upstreamModelId(modelId);
+  const cfg = lookupModelUpstream(modelId);
+  const result = {
+    modelId, upstreamModel, pipeline: "", provider: "", providerMatch: false,
+    available: [], observed: [], fallbacks: [], latencyMs: 0, note: "",
+  };
+
+  // 与真实代理链路完全一致地构造请求体，这样探测结果才代表线上行为
+  const probeBody = probeRequestBody(upstreamModel, PROBE_MAX_TOKENS);
+  if (cfg) applyUpstreamPrefs(probeBody, modelId);
+
+  const start = Date.now();
+  const first = await upstreamProbeCall(upstreamModel, probeBody, 180000);
+  result.latencyMs = Date.now() - start;
+  const routing = parseUpstreamRouting(first.json);
+  result.pipeline = routing.pipeline;
+  result.provider = routing.provider;
+  result.fallbacks = routing.fallbacks;
+
+  if (first.status !== 200) {
+    appendProbeNote(result, "基线请求返回 HTTP " + first.status + "：" + String(first.text || "").slice(0, 300));
+    return result;
+  }
+  result.observed = observedProviders(routing);
+  if (!routing.pipeline) {
+    appendProbeNote(result, "响应里既没有 provider_metadata.gateway.routing，也没有顶层 provider，无法判定管道");
+    return result;
+  }
+
+  // 钉住生效确认：实际命中的渠道是否就是钉住列表里的某一个（按归一化名比对，
+  // 因为 direct 管道回的显示名是 "DeepInfra"，而清单里是 "deepinfra"）
+  if (cfg && (cfg.upstreams || []).length) {
+    const actual = normalizeProviderSlug(routing.provider);
+    result.providerMatch = cfg.upstreams.some((p) => normalizeProviderSlug(p) === actual);
+    if (!result.providerMatch) {
+      appendProbeNote(result, "钉住 " + cfg.upstreams.join("/") + " 未生效：实际命中 " + routing.provider);
+    }
+  }
+
+  // 渠道枚举：故意带一个不存在的渠道名，尝试让网关拒绝并回吐清单。
+  // 某些模型会忽略筛选并正常生成回答，不能假定这一步一定不消耗 token。
+  const enumBody = probeRequestBody(upstreamModel, 16);
+  if (routing.pipeline === PIPELINE_PLANNER) {
+    enumBody.providerOptions = { gateway: { only: [PROBE_SENTINEL] } };
+  } else {
+    enumBody.provider = { only: [PROBE_SENTINEL] };
+  }
+  let enumRes;
+  try {
+    enumRes = await upstreamProbeCall(upstreamModel, enumBody, 60000);
+  } catch (e) {
+    appendProbeNote(result, "模型已响应，但渠道枚举请求失败：" + String((e && e.message) || e) +
+      "；响应元数据中的候选渠道不代表完整清单或可严格钉住");
+    return result;
+  }
+  if (enumRes.status === 200 && firstChoice(enumRes.json)) {
+    appendProbeNote(result, "模型已正常响应，但网关未按 only 筛选拒绝不存在的渠道，无法枚举完整清单；实际命中：" +
+      routing.provider + "。响应元数据中的候选渠道仅供参考，不能据此确认严格钉住生效");
+    return result;
+  }
+  result.available = parseAvailableProviders(enumRes.json, routing.pipeline);
+  if (!result.available.length) {
+    appendProbeNote(result, "模型已响应，但未能从渠道枚举响应（HTTP " + enumRes.status +
+      "）解析出完整清单；响应元数据中的候选渠道仅供参考：" + String(enumRes.text || "").slice(0, 300));
+  }
+  return result;
+}
+
+// 探测用的原始上游调用。刻意不复用 clineFetch：探测要读**非 200 响应体**
+// （渠道清单就藏在错误里），而正常链路会把非 200 转成错误并丢掉响应体；
+// 探测也不该计入使用量、不该触发冷却——那都是真实请求才有的副作用。
+async function upstreamProbeCall(modelId, body, timeoutMs) {
+  const pool = activeAccounts();
+  if (!pool.length) throw new Error("没有可用账号，无法探测");
+  const acc = pickAccount(modelId);
+  if (!acc) throw new Error("没有可用账号（该模型的额度都在冷却中），无法探测");
+  const token = await getAccountToken(acc);
+  const sessionId = body.session_id || ("sess_" + Date.now());
+  const resp = await fetchWithTimeout(CLINE_API_BASE + "/chat/completions", {
+    method: "POST",
+    headers: clineHeaders(sessionId, token),
+    body: JSON.stringify(body),
+  }, timeoutMs);
+  const text = await resp.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { /* 非 JSON 响应留给调用方判断 */ }
+  return { status: resp.status, text, json };
+}
+
+function saveProbeResult(modelId, result) {
+  const existing = runtimeState.perModel[modelId] || sanitizeUpstreamConfig({}) || {
+    upstreams: [], exclude: [], pinMode: "strict", redirect: "", aliases: [],
+    pipeline: "", available: [], observed: [], lastProvider: "", probedAt: 0, updatedAt: 0,
+  };
+  const entry = { ...existing };
+  // 只在同一条管道内保留部分结果：管道变了，旧的渠道清单就不适用了
+  if (result.pipeline) {
+    if (result.pipeline !== entry.pipeline) entry.available = [];
+    entry.pipeline = result.pipeline;
+    entry.observed = result.observed || [];
+    entry.lastProvider = result.provider || "";
+  }
+  if ((result.available || []).length) entry.available = result.available;
+  entry.probedAt = Date.now();
+  runtimeState.perModel[modelId] = entry;
+}
+
+// ---------------------------------------------------------------------------
+// 账号余额查询
+//
+// 官方 app.cline.bot/dashboard 把 API 返回的余额除以 1e6 显示，实测对齐：
+// 原始 499186 → 0.499186 Credits（显示 0.4992）。所以单位换算必须固定用这个除数。
+// 本地 acc_... ID 不是 Cline 的用户 ID，要先用 /users/me 解析出真正的 ID。
+// ---------------------------------------------------------------------------
+const MICROCREDITS_PER_CREDIT = 1000000;
+
+async function accountBalanceGET(acc, token, path) {
+  const url = CLINE_API_BASE + path;
+  let tk = token;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const resp = await fetchWithTimeout(url, {
+      method: "GET",
+      headers: clineHeaders("", tk),
+    }, 12000);
+    if (resp.status === 401 && attempt === 0) {
+      // token 可能刚失效：强制刷新一次再试（只试一次，避免死循环）
+      await resp.text().catch(() => "");
+      tk = await refreshAccountToken(acc);
+      continue;
+    }
+    if (resp.status !== 200) {
+      await resp.text().catch(() => "");
+      throw new Error("官方余额查询失败（HTTP " + resp.status + "）");
+    }
+    const body = await resp.json().catch(() => null);
+    if (!body || body.success === false || body.data === undefined || body.data === null) {
+      throw new Error("官方余额接口响应异常，请稍后重试");
+    }
+    return body.data;
+  }
+  throw new Error("账号认证失败，请重新登录");
+}
+
+// 余额缓存。刻意用「单飞」：并发的多个查询共享同一次上游请求，
+// 而失败结果的 TTL 短（10s），避免把一次网络抖动缓存成一分钟的「查不到」。
+const balanceCache = new Map();   // accountId -> { value, err, validUntil, pending, waiters }
+
+async function cachedAccountBalance(acc, force) {
+  const id = accountId(acc);
+  const now = Date.now();
+  let state = balanceCache.get(id);
+  if (state && state.pending) return state.promise;
+  if (state && !force && now < state.validUntil) {
+    if (state.err) throw state.err;
+    return state.value;
+  }
+
+  const promise = (async () => {
+    let value = null, err = null;
+    try {
+      const token = await getAccountToken(acc);
+      const user = await accountBalanceGET(acc, token, "/users/me");
+      if (!user || !user.id) throw new Error("官方接口未返回用户 ID");
+      const credits = await accountBalanceGET(acc, token, "/users/" + encodeURIComponent(user.id) + "/balance");
+      if (credits.balance === undefined || credits.balance === null) {
+        throw new Error("官方接口未返回 Credit 余额");
+      }
+      value = { balance: Number(credits.balance) / MICROCREDITS_PER_CREDIT, checkedAt: Date.now() };
+    } catch (e) {
+      err = e instanceof Error ? e : new Error(String(e));
+    }
+    balanceCache.set(id, {
+      value, err,
+      // 失败结果只缓存 10s：一次抖动不该变成一分钟的「余额不可用」
+      validUntil: Date.now() + (err ? 10000 : 60000),
+      pending: false,
+    });
+    if (err) throw err;
+    return value;
+  })();
+
+  balanceCache.set(id, { pending: true, promise, validUntil: 0, value: null, err: null });
+  // 失败时上面那个 catch 已经把错误记进缓存，这里再挂一次防止 unhandled rejection
+  promise.catch(() => {});
+  return promise;
+}
+
+// ---------------------------------------------------------------------------
+// 出口请求：带上超时与取消传播
+//
+// signal 必须是发起请求那个 HTTP 请求的信号：客户端断开时它会取消，从而中止已经
+// 发往上游的请求——否则客户端早走了，我们还在替它消耗账号额度、占着连接直到上游
+// 自己结束。首字节超时（ResponseHeaderTimeout 的等价物）单独用 AbortController
+// 控制：它限的是「请求发出 → 收到响应头」，对长回答是安全的（SSE 的响应头在生成
+// 一开始就发出来了），而整体超时会把正常的长时间流式响应一起掐断。
+// ---------------------------------------------------------------------------
+const UPSTREAM_FIRST_BYTE_TIMEOUT_MS = 120000;
+
+function fetchWithTimeout(url, init, timeoutMs, signal) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error("upstream_timeout")), timeoutMs || UPSTREAM_FIRST_BYTE_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort(new Error("client_aborted"));
+  if (signal) {
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  const cleanup = () => {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  };
+  return fetch(url, { ...init, signal: ctrl.signal }).then(
+    (resp) => {
+      // 响应头已到：首字节超时的使命结束（响应体可能还要流很久）。
+      // 但客户端取消的监听要保留到流转发结束，所以把清理句柄挂在响应上。
+      clearTimeout(timer);
+      resp.__cleanup = cleanup;
+      return resp;
+    },
+    (e) => { cleanup(); throw e; }
+  );
+}
+
+function releaseUpstream(resp) {
+  if (resp && typeof resp.__cleanup === "function") {
+    try { resp.__cleanup(); } catch (e) { /* 清理失败无副作用 */ }
+    resp.__cleanup = null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 请求限流（登录 / 账号操作）
+//
+// 「先占位再校验」：并发请求会在同一个窗口内同时读到计数、同时通过，所以必须
+// 先自增再判断。IP 只取直连对端，**刻意忽略 forwarded 头**——那是客户端可伪造的，
+// 拿它做限流键等于把限流关掉。
+// ---------------------------------------------------------------------------
+const LOGIN_WINDOW_MS = 5 * 60 * 1000;
+const MAX_LOGIN_ATTEMPTS = 10;
+const MAX_LIMITER_CLIENTS = 4096;
+const loginAttempts = new Map();   // ip -> { count, expires }
+
+function allowLoginAttempt(ip) {
+  const now = Date.now();
+  for (const [key, rec] of loginAttempts) {
+    if (rec.expires <= now) loginAttempts.delete(key);
+  }
+  let rec = loginAttempts.get(ip);
+  if (!rec) {
+    if (loginAttempts.size >= MAX_LIMITER_CLIENTS) return false;
+    rec = { count: 0, expires: now + LOGIN_WINDOW_MS };
+  }
+  if (rec.count >= MAX_LOGIN_ATTEMPTS) return false;
+  rec.count++;
+  loginAttempts.set(ip, rec);
+  return true;
+}
+
+function clientIp(request) {
+  // 本地/直连场景没有 forwarded 头，用占位符即可（限流是进程级的，
+  // 单机自用时所有请求都归到同一个桶，正是想要的行为）
+  const hit = request.headers.get("cf-connecting-ip") || request.headers.get("x-real-ip");
+  return hit || "local";
+}
+
+// 请求体上限：本地服务把整个 body 读进内存，没上限的话任何人都能 POST 一个
+// 任意大的 body 直到 OOM。32 MiB 远大于正常请求（128k tokens 上下文约几百 KB～1 MB）。
+const MAX_BODY_BYTES = 32 << 20;
+
 // 账号管理动作。返回给前端的是**动作执行后的完整账号列表**，
 // 这样前端一次请求就能刷新界面，不用再补一次 /v1/health。
 async function handleAccountAction(request, env) {
@@ -762,25 +2351,23 @@ async function handleAccountAction(request, env) {
 
   const action = String(body.action || "").trim();
   const id = String(body.id || "").trim();
+  const modelId = String(body.modelId || body.model_id || "").trim();
   const respond = (extra) =>
     jsonResponse({ ok: true, action, accounts: accountSummaries(env), ...extra }, 200);
 
   // 批量动作
   if (action === "enableAll") {
-    disabledIds.clear();
+    runtimeState.disabledIds = [];
+    scheduleStateFlush();
     return respond({ message: "已启用全部账号" });
   }
   if (action === "resetAll") {
-    const now = Date.now();
-    let n = 0;
+    const n = clearAllCooldowns();
     for (const a of listAccounts(env)) {
-      if (a.cooldownUntil > now) n++;
-      a.cooldownUntil = 0;
-      a.cooldownReason = null;
       a.accessToken = null;
       a.expiry = 0;
     }
-    return respond({ message: `已重置 ${n} 个冷却中的账号` });
+    return respond({ message: `已清除 ${n} 个「账号×模型」冷却` });
   }
 
   if (!action) {
@@ -796,23 +2383,37 @@ async function handleAccountAction(request, env) {
   }
 
   if (action === "disable") {
-    disabledIds.add(target.id);
+    const disabled = disabledSet();
+    if (!disabled.includes(target.id)) disabled.push(target.id);
+    scheduleStateFlush();
     // 停用当前正在用的账号时立刻让位，否则它会一直用到下次挑号
     if (currentAccount === target) currentAccount = null;
     return respond({ message: "已停用，该账号将不再参与轮询" });
   }
 
   if (action === "enable") {
-    disabledIds.delete(target.id);
+    runtimeState.disabledIds = disabledSet().filter((x) => x !== target.id);
+    scheduleStateFlush();
     return respond({ message: "已启用，该账号将重新参与轮询" });
   }
 
+  // reset：清掉这个账号**全部模型**的冷却 + token 缓存（整号复活）
   if (action === "reset") {
-    target.cooldownUntil = 0;
-    target.cooldownReason = null;
+    const n = clearCooldownAccount(target.id);
     target.accessToken = null;
     target.expiry = 0;
-    return respond({ message: "已清除冷却，下次请求即可使用该账号" });
+    return respond({ message: n ? `已清除 ${n} 个模型的冷却` : "该账号当前没有冷却中的模型" });
+  }
+
+  // clearCooldown：清掉单个「账号 × 模型」的冷却。
+  // 冷却时长是我们按 429 猜的（上游有时不说明重置时间），猜错了（比如额度其实
+  // 已恢复）用户要能自己纠正，而不是干等。
+  if (action === "clearCooldown") {
+    if (!modelId) {
+      return jsonResponse({ error: { message: "缺少 modelId 参数", type: "account_error" } }, 400);
+    }
+    const ok = clearCooldownModel(target.id, modelId);
+    return respond({ ok: ok, message: ok ? "已解除该模型的冷却" : "该模型当前不在冷却中" });
   }
 
   if (action === "remove") {
@@ -827,94 +2428,241 @@ async function handleAccountAction(request, env) {
       }, 400);
     }
     // 运行时账号按 originToken 匹配（上游轮换过 refreshToken 也认得出来）
-    const before = dynamicAccounts.length;
-    dynamicAccounts = dynamicAccounts.filter((d) => d.refreshToken !== target.originToken);
+    const list = runtimeState.dynamicAccounts;
+    const before = list.length;
+    runtimeState.dynamicAccounts = list.filter((d) => (d.originToken || d.refreshToken) !== target.originToken);
     accountPoolDirty = true;
-    disabledIds.delete(target.id);
+    runtimeState.disabledIds = disabledSet().filter((x) => x !== target.id);
+    clearCooldownAccount(target.id);
+    scheduleStateFlush();
     if (currentAccount === target) currentAccount = null;
-    return respond({ removed: before - dynamicAccounts.length, message: "已移除该临时账号" });
+    return respond({ removed: before - runtimeState.dynamicAccounts.length, message: "已移除该账号" });
   }
 
   return jsonResponse({ error: { message: "未知的 action: " + action, type: "account_error" } }, 400);
 }
 
-// 取得当前账号的 accessToken（独立缓存，失效/冷却则刷新）
+// 账号详情：这个账号现在哪些模型到了上限、什么时候重置、还有哪些模型可用。
+//
+// 为什么需要它：冷却表只按「账号×模型」平铺，看不出「某个账号下哪些模型还能用」；
+// 而额度的粒度恰恰就是账号×模型，所以视图要对齐这个粒度。
+async function handleAccountDetail(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+
+  const url = new URL(request.url);
+  const id = (url.searchParams.get("id") || "").trim();
+  if (!id) return jsonResponse({ error: { message: "缺少 id 参数", type: "account_error" } }, 400);
+
+  const acc = listAccounts(env).find((a) => a.id === id);
+  if (!acc) return jsonResponse({ error: { message: "找不到该账号", type: "account_error" } }, 404);
+
+  const limited = cooldownSnapshot(id);
+  const limitedSet = new Set(limited.map((c) => c.model_id));
+  // 用量按「本地日」口径展示，与账号列表一致
+  const today = usageDayKey(Date.now());
+  const accUsage = usageStats.byAccount[id];
+  // 「现在可用的模型」列的是**已启用模型**：账号详情要回答的是「我常用的这些模型里
+  // 哪些现在不能用」，列四百多个上游模型对判断没有帮助。
+  const allModels = effectiveModelIds();
+
+  const data = {
+    id,
+    email: acc.email || "",
+    enabled: acc.enabled,
+    runtime: !!acc.runtime,
+    cooldown_minutes: cooldownMinutes(),
+    limited,
+    // 受限的模型不再列入「可用」，避免同一模型在两处出现
+    other_models: allModels.filter((m) => !limitedSet.has(m)),
+    token_cached: !!(acc.accessToken && Date.now() < acc.expiry),
+    expiry: acc.expiry || 0,
+    stats: {
+      ok: acc.okCount || 0,
+      fail: acc.failCount || 0,
+      last_error: acc.lastError || null,
+      last_error_at: acc.lastErrorAt || 0,
+      last_used_at: acc.lastUsedAt || 0,
+    },
+    usage_today: (accUsage && accUsage.byDay && accUsage.byDay[today]) || emptyUsage(),
+    usage_total: accUsage || emptyUsage(),
+  };
+
+  // reveal=1 才回完整 refreshToken：详情是「看一眼」的常规操作，不该每次都把可长期
+  // 使用的凭据送进浏览器；但用户确实需要能把它复制出来的入口（比如换机器部署），
+  // 所以留一个显式通道。
+  if (url.searchParams.get("reveal") === "1") {
+    data.refresh_token = acc.refreshToken;
+    // 该账号来自环境变量：上游轮换后的新 token 没法写回环境变量，这里给的是内存里的现值
+    data.rotated = !!(acc.originToken && acc.refreshToken && acc.originToken !== acc.refreshToken);
+  } else {
+    data.refresh_token_masked = maskCredential(acc.refreshToken);
+  }
+  return jsonResponse({ ok: true, ...data }, 200);
+}
+
+// 只留首尾便于辨认，中间一律打码。
+// 短于 16 字符时全部打码：这类值几乎不可能是真 token，
+// 但按「前6后4」处理会把它们几乎完整暴露出来。
+function maskCredential(v) {
+  const s = String(v || "");
+  if (!s) return "";
+  if (s.length < 16) return "*".repeat(s.length);
+  return s.slice(0, 6) + "*".repeat(8) + s.slice(-4);
+}
+
+// 账号余额。官方 app.cline.bot/dashboard 把 API 余额除以 1e6 显示，所以单位换算
+// 固定用这个除数（见 MICROCREDITS_PER_CREDIT 的说明）。
+async function handleAccountBalance(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+
+  const url = new URL(request.url);
+  const id = (url.searchParams.get("id") || "").trim();
+  if (!id) return jsonResponse({ error: { message: "缺少 id 参数", type: "account_error" } }, 400);
+
+  const acc = listAccounts(env).find((a) => a.id === id);
+  if (!acc) return jsonResponse({ error: { message: "找不到该账号", type: "account_error" } }, 404);
+
+  try {
+    const value = await cachedAccountBalance(acc, url.searchParams.get("refresh") === "1");
+    return jsonResponse({ ok: true, ...value }, 200);
+  } catch (e) {
+    return jsonResponse({
+      error: { message: String((e && e.message) || e), type: "balance_error" },
+    }, 502);
+  }
+}
+
+// 取得当前账号的 accessToken（独立缓存，失效则刷新）
+//
+// 单飞：同一个账号在同一时刻只允许一次 /auth/refresh。上游会轮换 refreshToken，
+// 并发刷新时后到的那次会拿着已被换掉的 token 去换，必然 invalid_grant ——表现为
+// 「同一账号偶发刷新失败」，把并发请求一起拖垮。后来者等前一个结果即可。
+//
+// 刻意不再这里做「账号级冷却」：额度是「账号×模型」量级（见 cooldowns），
+// 账号级冷却会让模型 A 到上限时同账号的模型 B 也用不了。
 async function getAccountToken(account) {
   const now = Date.now();
-  // 冷却期内不可用
-  if (account.cooldownUntil > now) {
-    throw new Error("account_cooldown");
-  }
-  if (account.accessToken && now < account.expiry) {
-    return account.accessToken;
-  }
-  const resp = await fetch(CLINE_API_BASE + "/auth/refresh", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      refreshToken: account.refreshToken,
-      grantType: "refresh_token",
-    }),
-  });
-  if (!resp.ok) {
-    // 刷新失败：冷却 60s，交给上层切号
-    account.cooldownUntil = now + 60 * 1000;
-    account.cooldownReason = "auth";
-    throw new Error("refresh_failed");
-  }
-  const data = await resp.json();
-  const accessToken = data?.data?.accessToken;
-  if (!accessToken) {
-    account.cooldownUntil = now + 60 * 1000;
-    account.cooldownReason = "auth";
-    throw new Error("refresh_no_token");
-  }
-  account.accessToken = accessToken;
-  // 顺带采集邮箱：环境变量里的账号本来没有邮箱可显示，而刷新响应带 userInfo.email。
-  // 只在缺失时写一次，避免每个刷新周期都覆盖。
-  if (!account.email) {
-    const em = data?.data?.userInfo?.email;
-    if (typeof em === "string" && em.trim()) account.email = em.trim();
-  }
-  // Cline 会在刷新时轮换 refreshToken；必须保存新 token，避免下一次刷新 invalid_grant。
-  if (typeof data?.data?.refreshToken === "string" && data.data.refreshToken.trim()) {
-    account.refreshToken = data.data.refreshToken.trim();
-  }
-  // 过期时间：优先服务端，兜底 10 分钟，留 60s 余量
-  const expiresAt = data?.data?.expiresAt;
-  let expiry = now + 10 * 60 * 1000;
-  if (typeof expiresAt === "number") {
-    expiry = expiresAt;
-  } else if (typeof expiresAt === "string") {
-    const t = Date.parse(expiresAt);
-    if (!isNaN(t)) expiry = t;
-  }
-  account.expiry = expiry - 60000;
-  return accessToken;
-}
+  if (account.accessToken && now < account.expiry) return account.accessToken;
+  if (account.refreshInFlight) return account.refreshInFlight;
 
-// 轮询选择一个可用账号，返回该账号对象（并设置 currentAccount）
-// 返回 null 表示所有账号都在冷却中
-function pickAccount(pool) {
-  const now = Date.now();
-  if (pool.length === 0) return null;
-  // 优先复用当前可用账号（避免同一次请求内频繁切号）
-  if (currentAccount && pool.includes(currentAccount) &&
-      (!currentAccount.cooldownUntil || currentAccount.cooldownUntil <= now)) {
-    return currentAccount;
-  }
-  for (let k = 0; k < pool.length; k++) {
-    const acc = pool[accountIndex % pool.length];
-    accountIndex = (accountIndex + 1) % pool.length;
-    if (!acc.cooldownUntil || acc.cooldownUntil <= now) {
-      currentAccount = acc;
-      return acc;
+  const promise = (async () => {
+    const resp = await fetchWithTimeout(CLINE_API_BASE + "/auth/refresh", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        refreshToken: account.refreshToken,
+        grantType: "refresh_token",
+      }),
+    }, 30000);
+    if (!resp.ok) {
+      // 401 是永久性的（refreshToken 已被上游作废），其余按瞬时故障处理
+      const permanent = resp.status === 401 || resp.status === 403;
+      const bodyText = await resp.text().catch(() => "");
+      const err = new Error(permanent ? "refresh_rejected" : "refresh_failed");
+      err.permanent = permanent;
+      err.status = resp.status;
+      err.detail = bodyText.slice(0, 200);
+      throw err;
     }
+    const data = await resp.json();
+    const accessToken = data?.data?.accessToken;
+    if (!accessToken) throw new Error("refresh_no_token");
+    account.accessToken = accessToken;
+    // 顺带采集邮箱：环境变量里的账号本来没有邮箱可显示，而刷新响应带 userInfo.email。
+    // 只在缺失时写一次，避免每个刷新周期都覆盖。
+    if (!account.email) {
+      const em = data?.data?.userInfo?.email;
+      if (typeof em === "string" && em.trim()) account.email = em.trim();
+    }
+    // Cline 会在刷新时轮换 refreshToken。新 token 必须**立刻落盘**：
+    // 旧 token 在上游已经作废，只把新值留在内存里，重启后就拿着一把死钥匙，
+    // 表现为下次启动起所有请求都 invalid_grant。
+    const rotated = typeof data?.data?.refreshToken === "string" ? data.data.refreshToken.trim() : "";
+    if (rotated && rotated !== account.refreshToken) {
+      account.refreshToken = rotated;
+      persistRotatedToken(account);
+    }
+    // 账号不一致时补写邮箱（旧对象复用时 email 可能刚被采集到）
+    account.expiry = parseExpiryMs(data?.data?.expiresAt, now) - 60000;
+    return accessToken;
+  })();
+
+  account.refreshInFlight = promise;
+  try {
+    return await promise;
+  } finally {
+    account.refreshInFlight = null;
   }
-  return null; // 全部冷却中
 }
 
-async function getAccessToken(env) {
+// 把轮换后的 refreshToken 写回它该在的地方（设置里的运行时账号 + 落盘）。
+// 环境变量账号没法改（那是部署配置），只能在控制台提示用户去更新。
+function persistRotatedToken(account) {
+  const origin = account.originToken || account.refreshToken;
+  const list = runtimeState.dynamicAccounts;
+  const entry = list.find((d) => (d.originToken || d.refreshToken) === origin);
+  if (entry) {
+    entry.refreshToken = account.refreshToken;
+    if (!entry.originToken) entry.originToken = origin;
+    scheduleStateFlush();
+    console.log("[token] 已把轮换后的 refreshToken 落盘（账号 " + account.id + "）");
+    return true;
+  }
+  // 环境变量账号：轮换值只存在内存里，重启会退回环境变量里的旧值。
+  // 这不是能自动修的问题（改不了用户的部署配置），所以要显式提示。
+  if (!account.__rotatedWarned) {
+    account.__rotatedWarned = true;
+    console.log("[token] 账号 " + account.id + " 来自 CLINE_REFRESH_TOKEN，上游轮换后的 " +
+      "refreshToken 无法写回环境变量；请在控制台「账号」页复制最新 token 并更新配置，否则重启后该账号会失效。");
+  }
+  return false;
+}
+
+function parseExpiryMs(expiresAt, now) {
+  const fallback = now + 10 * 60 * 1000;
+  if (typeof expiresAt === "number") return expiresAt;
+  if (typeof expiresAt === "string") {
+    const t = Date.parse(expiresAt);
+    if (!isNaN(t)) return t;
+  }
+  return fallback;
+}
+
+// 强制刷新某账号的 token（余额查询等场景拿到 401 后调用）
+async function refreshAccountToken(account) {
+  account.accessToken = null;
+  account.expiry = 0;
+  return getAccountToken(account);
+}
+
+// 按策略挑一个账号。modelId 用于「账号×模型」级冷却过滤：某账号的该模型在冷却中
+// 就跳过，同账号的其它模型不受影响。
+// strategy: round_robin 轮询 / fill 先用满一个再换 / random 随机
+function pickAccount(modelId) {
+  const pool = activeAccounts();
+  const now = Date.now();
+  const usable = pool.filter((a) => !(modelId && isCooling(accountId(a), modelId, now)));
+  if (!usable.length) return null;
+
+  const strategy = runtimeState.strategy;
+  if (strategy === "fill") return usable[0];
+  if (strategy === "random") return usable[Math.floor(Math.random() * usable.length)];
+
+  // round_robin：游标可能落在已被过滤掉的账号上，从游标处往后找第一个可用的
+  const start = accountIndex % pool.length;
+  for (let i = 0; i < pool.length; i++) {
+    const idx = (start + i) % pool.length;
+    const acc = pool[idx];
+    if (!usable.includes(acc)) continue;
+    accountIndex = (idx + 1) % pool.length;
+    return acc;
+  }
+  return usable[0];
+}
+
+async function getAccessToken(env, modelId) {
   const pool = activeAccounts(env); // 已停用的账号不参与轮询
   if (pool.length === 0) {
     const all = listAccounts(env);
@@ -926,91 +2674,128 @@ async function getAccessToken(env) {
     }
     throw new Error("缺少 CLINE_REFRESH_TOKEN 环境变量");
   }
+
   const now = Date.now();
-  // 从轮询游标开始，逐个尝试可用账号（跳过冷却中的）
-  const start = accountIndex % pool.length;
-  for (let i = 0; i < pool.length; i++) {
-    const acc = pool[(start + i) % pool.length];
-    if (acc.cooldownUntil && acc.cooldownUntil > now) {
-      console.log(`[account] 跳过账号 #${(start + i) % pool.length}（冷却中，剩余 ${Math.round((acc.cooldownUntil - now) / 1000)}s）`);
-      continue;
-    }
+  // 按「账号×模型」过滤：该模型正在冷却的账号直接跳过，不浪费一次上游请求。
+  // 这一步必须在发起请求之前——只在响应回来后才判冷却的话，请求已经打出去了，
+  // 冷却是"事后"记录，等于每次都要白烧一次额度才发现没号可用。
+  const usable = modelId
+    ? pool.filter((a) => !isCooling(accountId(a), modelId, now))
+    : pool;
+  if (!usable.length) {
+    // 所有账号的这个模型都在冷却：直接告诉调用方等多久，不要空转
+    const snap = cooldownSnapshot(null).filter((c) => c.model_id === modelId);
+    const earliest = snap.length ? Math.min(...snap.map((c) => c.until)) : now + 60000;
+    const err = new Error("all_accounts_cooling");
+    err.retryAfterMs = Math.max(earliest - now, 0);
+    err.accountCount = pool.length;
+    err.modelId = modelId;
+    err.kinds = [...new Set(snap.map((c) => c.kind))];
+    throw err;
+  }
+
+  // 顺序由策略决定（pickAccount 内部实现）；token 刷新失败则顺延到下一个。
+  // 走同一个 pickAccount 而不是各写一套轮询：两处实现漂移会让「设置里改了策略
+  // 但真实流量没变」——这类"设置看起来生效了其实没生效"的 bug 最难发现。
+  const order = accountOrder(usable);
+  let lastErr = null;
+  for (const acc of order) {
     try {
       const token = await getAccountToken(acc);
-      accountIndex = ((start + i) + 1) % pool.length; // 游标后移，实现轮询
       currentAccount = acc;
       return token;
     } catch (e) {
+      lastErr = e;
       continue; // 刷新失败，试下一个号
     }
   }
 
-  // 所有账号都在冷却中。区分两种冷却原因：
-  //  * quota/limit（额度用尽、429、空响应）→ 清冷却再打上游毫无意义，上游只会再拒一次，
-  //    白白消耗一次请求；应直接把"全冷却"信息回给客户端，等冷却结束再试。
-  //  * auth（刷新失败/401）→ 可能是瞬时网络抖动，值得清冷却重试一次。
-  const allQuotaCooling = pool.every((a) => a.cooldownReason === "limit" || a.cooldownReason === "empty");
-  if (allQuotaCooling) {
-    const earliest = Math.min(...pool.map((a) => a.cooldownUntil || now));
-    const err = new Error("all_accounts_cooling");
-    err.retryAfterMs = Math.max(earliest - now, 0);
-    err.accountCount = pool.length;
-    throw err;
-  }
+  // 可用账号的 token 全部刷新失败。永久性失败（refreshToken 已作废）要说清是哪个账号，
+  // 否则用户只能看到"所有账号都失败"而不知道去修哪个。
+  const err = new Error("all_accounts_refresh_failed");
+  err.accountCount = usable.length;
+  err.detail = lastErr ? String(lastErr.message || lastErr) : "";
+  err.permanentHint = lastErr && lastErr.permanent
+    ? "有账号的 refreshToken 已失效（上游返回 401）。请在控制台「账号」页重新登录，或把最新的 refreshToken 填进 CLINE_REFRESH_TOKEN。"
+    : "";
+  throw err;
+}
 
-  // 兜底：清掉最早账号的冷却，最后试一次，仍失败则抛出
-  const acc = pool[0];
-  currentAccount = acc;
-  acc.cooldownUntil = 0;
-  acc.cooldownReason = null;
-  acc.accessToken = null;
-  acc.expiry = 0;
-  try {
-    return await getAccountToken(acc);
-  } catch (e) {
-    throw new Error("所有账号刷新 token 均失败");
+// 按当前策略把候选账号排成一个尝试顺序。
+// fill：永远先用第一个（用满一个号再换）；random：打乱；round_robin：从游标起轮转。
+function accountOrder(usable) {
+  const strategy = runtimeState.strategy;
+  if (strategy === "random") {
+    const copy = usable.slice();
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
   }
+  if (strategy === "fill") return usable.slice();
+  // round_robin：从游标处开始轮转，游标随后前移一位
+  const pool = accounts;
+  const start = pool.length ? accountIndex % pool.length : 0;
+  const out = [];
+  for (let i = 0; i < pool.length; i++) {
+    const acc = pool[(start + i) % pool.length];
+    if (usable.includes(acc)) out.push(acc);
+  }
+  for (const acc of usable) if (!out.includes(acc)) out.push(acc);
+  accountIndex = (start + 1) % (pool.length || 1);
+  return out;
 }
 
 // Cline 客户端指纹请求头（官方靠这些头识别"是不是 Cline 客户端"）
 // 缺少会被 403: "deepseek/deepseek-v4-flash is only available via Cline product surfaces"
 // token 显式传参（原先读模块级 currentToken，切号时可能串到别的账号）
+const CLINE_FINGERPRINT_HEADERS = {
+  "User-Agent": "Cline/3.0.47",
+  "HTTP-Referer": "https://cline.bot",
+  "X-Title": "Cline",
+  "X-IS-MULTIROOT": "false",
+  "X-CLIENT-TYPE": "cline-sdk",
+  "X-CLIENT-VERSION": "3.0.47",
+  "X-PLATFORM": "terminal",
+  "X-PLATFORM-VERSION": "3.0.47",
+  "X-CORE-VERSION": "0.0.66",
+};
+
 function clineHeaders(sessionId, token) {
-  return {
+  const h = {
     Authorization: "Bearer workos:" + token,
     "Content-Type": "application/json",
-    "User-Agent": "Cline/3.0.47",
-    "HTTP-Referer": "https://cline.bot",
-    "X-Title": "Cline",
-    "X-IS-MULTIROOT": "false",
-    "X-CLIENT-TYPE": "cline-sdk",
-    "X-CLIENT-VERSION": "3.0.47",
-    "X-PLATFORM": "terminal",
-    "X-PLATFORM-VERSION": "3.0.47",
-    "X-CORE-VERSION": "0.0.66",
+    ...CLINE_FINGERPRINT_HEADERS,
     "X-Task-ID": sessionId,
   };
+  // 控制台里配的自定义头覆盖内置值。上游会靠这些头判断"是不是 Cline 客户端"，
+  // 所以覆盖是危险动作——但版本号变化（客户端升级）时会需要它，交回给用户。
+  for (const [k, v] of Object.entries(runtimeState.headers || {})) {
+    if (typeof v === "string" && v) h[k] = v;
+  }
+  return h;
 }
 
-async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
-  const token = await getAccessToken(env);
+async function clineFetch(env, path, bodyObj, sessionId, modelId, signal, retried = false) {
+  const token = await getAccessToken(env, modelId);
   const headers = clineHeaders(sessionId, token);
   // 把此刻的账号钉在响应上：usage 要等流读完才拿得到，那时 currentAccount
   // 可能已经被下一个请求改掉了，只有随响应携带的引用才准（见统计模块约束 2）
-  const resp = bindResponseAccount(await fetch(CLINE_API_BASE + path, {
+  const resp = bindResponseAccount(await fetchWithTimeout(CLINE_API_BASE + path, {
     method: "POST",
     headers,
     body: JSON.stringify(bodyObj),
-  }));
+  }, UPSTREAM_FIRST_BYTE_TIMEOUT_MS, signal));
   if (resp.status === 401 && !retried) {
-    // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
+    // token 失效：清掉该账号的缓存，强制刷新后重试一次。
+    // 刻意不在这里标记冷却——401 是账号级凭据问题，与「账号×模型」的额度冷却
+    // 是两件事，混在一起会让额度信息被凭据错误覆盖掉。
     if (currentAccount) {
-      currentAccount.cooldownUntil = Date.now() + 60 * 1000;
-      currentAccount.cooldownReason = "auth";
       currentAccount.accessToken = null;
       currentAccount.expiry = 0;
     }
-    return clineFetch(env, path, bodyObj, sessionId, true);
+    return clineFetch(env, path, bodyObj, sessionId, modelId, signal, true);
   }
   return resp;
 }
@@ -1034,32 +2819,19 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// 解析上游 429/限流响应里的等待时间，返回毫秒
-// 支持格式: "Try again in 2h 51m" / "Try again in 30m" / "Try again in 1h" / "Try again in 15s"
-function parseCooldown(body, status) {
-  const m = (body || "").match(/try again in (?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
-  if (m) {
-    const h = parseInt(m[1] || 0, 10);
-    const min = parseInt(m[2] || 0, 10);
-    const s = parseInt(m[3] || 0, 10);
-    const ms = (h * 3600 + min * 60 + s) * 1000;
-    if (ms > 0) return Math.min(ms, 6 * 3600 * 1000); // 上限 6 小时
-  }
-  // 429 默认 5 分钟；空响应默认 60 秒
-  if (status === 429) return 5 * 60 * 1000;
-  return 60 * 1000;
-}
-
-// 带重试的 clineFetch：429限流/空响应/5xx 自动切换账号 + 指数退避重试
-// 一个号额度用完或限流(429 Daily free limit reached)时：
-//   - 冷却该账号（冷却时长按上游提示，如 2h51m）
+// 带重试的 clineFetch：429 额度/限流、空响应自动切换账号重试。
+// 一个号的某模型额度用完或限流时：
+//   - 只冷却「该账号 × 该模型」这一组合（冷却时长优先用上游给的重置时间）
 //   - 自动轮换到下一个号重试同一请求
-// 所有账号都冷却时，直接返回原始响应（不空转）
-async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = false, maxRetries = 4) {
+// 所有账号的该模型都在冷却时，直接返回原始响应（不空转）
+//
+// modelId 是本次实际发给上游的模型（冷却键必须与实际查询的模型一致，
+// 否则会标记到一个永远不会被查询的 key 上，冷却静默失效）。
+async function clineFetchWithRetry(env, path, bodyObj, sessionId, modelId, maxRetries = 4, signal) {
   let lastResp = null;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     // 通过队列串行执行，避免并发空响应
-    const resp = await enqueue(() => clineFetch(env, path, bodyObj, sessionId));
+    const resp = await enqueue(() => clineFetch(env, path, bodyObj, sessionId, modelId, signal));
     lastResp = resp;
 
     // ⚠️ 关键：成功响应必须原样立刻返回，绝不能在这里 clone().text() 读 body。
@@ -1074,38 +2846,52 @@ async function clineFetchWithRetry(env, path, bodyObj, sessionId, isStream = fal
     }
 
     // 非 2xx：读 body 用于判定"额度/限流"信号（需要切号）
-    // 1. 429（Daily free limit reached / rate limit）
+    // 1. 429（free limit reached / rate limit）
     // 2. 5xx 且含 empty response content
     let bodyText = "";
     try {
       bodyText = await resp.clone().text();
-    } catch (e) {}
+    } catch (e) { /* body 已不可读：按非限流错误处理 */ }
     const isLimitHit =
       resp.status === 429 ||
       (resp.status >= 500 && bodyText.includes("empty response content"));
 
     if (isLimitHit) {
-      const cooldownMs = parseCooldown(bodyText, resp.status);
-      if (currentAccount) {
-        currentAccount.cooldownUntil = Date.now() + cooldownMs;
-        currentAccount.cooldownReason = "limit";
-        currentAccount.accessToken = null;
-        currentAccount.expiry = 0;
+      const acc = currentAccount;
+      if (acc) {
+        const { ttl, info } = applyCooldown(acc, modelId, bodyText, Date.now());
         markAccountResult("HTTP " + resp.status + " 额度/限流");
-        console.log(`[account-switch] 账号额度/限流，冷却 ${Math.round(cooldownMs / 1000)}s，切换到下一个`);
+        const kindNote = info.kind === "unknown" ? "（未识别的 429）" : "（" + info.kind + "）";
+        console.log("[account-switch] " + (acc.email || acc.id) + " × " + modelId +
+          " 冷却 " + Math.round(ttl / 1000) + "s " + kindNote +
+          (info.resetsAt ? "，重置于 " + formatResetAt(info.resetsAt) : "") + "，切换到下一个");
       }
-      // 还有可用账号 → 短退避后重试（会切到下一个号）
+      // 还有账号的该模型可用 → 短退避后重试（会切到下一个号）
       const pool = activeAccounts(env);
-      const hasOther = pool.some((a) => !a.cooldownUntil || a.cooldownUntil <= Date.now());
+      const now = Date.now();
+      const hasOther = pool.some((a) => !isCooling(accountId(a), modelId, now));
       if (!hasOther) {
-        console.log(`[retry] 所有账号均冷却，直接返回上游响应`);
+        console.log("[retry] 所有账号的该模型均在冷却，直接返回上游响应");
         return resp; // 不空转，把 429/错误返回给客户端
       }
       await sleep(500 + Math.floor(Math.random() * 500));
       continue;
     }
 
-    // 其他错误（403/400/401 等）不重试，直接返回
+    // 401：token 可能刚失效（并发下 refresh 慢了一步），强制刷新后重试一次。
+    // clineFetch 内部已做过一次同 token 重试，走到这里说明刷新也没救回来。
+    if (resp.status === 401 && attempt < maxRetries) {
+      const acc = currentAccount;
+      if (acc) {
+        acc.accessToken = null;
+        acc.expiry = 0;
+        markAccountResult("HTTP 401 凭据失效");
+      }
+      await sleep(300);
+      continue;
+    }
+
+    // 其他错误（403/400/402 等）不重试，直接返回
     markAccountResult("HTTP " + resp.status);
     return resp;
   }
@@ -1225,14 +3011,24 @@ async function handleLoginPoll(request, env) {
     }
     const email = ((rj.data && rj.data.userInfo) || {}).email || "";
 
-    // 追加到运行时账号池：本次实例立即生效，无需重启
-    if (!dynamicAccounts.some((a) => a.refreshToken === rt)) {
-      dynamicAccounts.push({ refreshToken: rt, accessToken: null, expiry: 0, cooldownUntil: 0, email });
+    // 追加到账号池：本次实例立即生效，无需重启。
+    // 同时落盘（本地运行时由 local-server.js 写文件），所以重启也不丢。
+    const list = runtimeState.dynamicAccounts;
+    const existing = list.find((a) => (a.originToken || a.refreshToken) === rt || a.refreshToken === rt);
+    if (!existing) {
+      list.push({ refreshToken: rt, originToken: rt, email });
       accountPoolDirty = true; // 让 parseAccounts 重建，纳入新账号
+      scheduleStateFlush();
     }
-    console.log("[login] 新增账号成功，当前运行时账号数:", dynamicAccounts.length);
+    console.log("[login] 新增账号成功，当前账号数:", list.length);
 
-    return jsonResponse({ ok: true, status: "success", email: email, refresh_token: rt }, 200);
+    return jsonResponse({
+      ok: true, status: "success", email,
+      refresh_token: rt,
+      // 告诉前端「这份 token 是否已经落盘」：本地运行会自动存，云端只能手动搬。
+      // 用 runtimeState 是否接了持久化钩子来判断，比猜运行环境可靠。
+      persisted: !!statePersistCb,
+    }, 200);
   } catch (e) {
     return jsonResponse({
       ok: false, status: "failed",
@@ -1242,6 +3038,113 @@ async function handleLoginPoll(request, env) {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// 请求/响应公共辅助
+// ---------------------------------------------------------------------------
+
+// 读 JSON 请求体，带大小上限。
+// 本地服务把整个 body 读进内存，没上限的话任何人都能 POST 一个任意大的 body
+// 直到 OOM。Content-Length 存在时先挡一道（省得白读一遍），实际字节数再验一次
+// （chunked 请求没有 Content-Length，只信头部会被绕过）。
+async function readJsonBody(request) {
+  const declared = Number(request.headers.get("content-length") || 0);
+  if (declared && declared > MAX_BODY_BYTES) {
+    const err = new Error("body_too_large");
+    err.declared = declared;
+    throw err;
+  }
+  const text = await request.text();
+  if (text.length > MAX_BODY_BYTES) {
+    const err = new Error("body_too_large");
+    err.declared = text.length;
+    throw err;
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    throw new Error("invalid_json");
+  }
+}
+
+function bodyErrorResponse(e) {
+  const msg = String((e && e.message) || e);
+  if (msg === "body_too_large") {
+    return jsonResponse({
+      error: {
+        message: "请求体过大（上限 " + Math.round(MAX_BODY_BYTES / 1048576) + " MiB）" +
+                 (e && e.declared ? "，实际 " + e.declared + " 字节" : ""),
+        type: "request_too_large",
+      },
+    }, 413);
+  }
+  if (msg === "invalid_json") {
+    return jsonResponse({ error: { message: "Invalid JSON body", type: "parse_error" } }, 400);
+  }
+  return jsonResponse({ error: { message: msg, type: "api_error" } }, 400);
+}
+
+// 把上游状态码映射成给客户端的状态码。
+//
+// 关键一条：上游 401/403 是**我们**的账号凭据/风控出了问题，不是客户端的 API Key
+// 有问题。原样透传会让客户端以为自己的 Key 错了，跑去反复重配。所以映射成 502
+// （"我们的链路问题"），并附上账号侧的排查提示。
+function clientStatusForUpstream(upstreamStatus) {
+  if (upstreamStatus === 429) return 429;
+  if (upstreamStatus === 401 || upstreamStatus === 403) return 502;
+  if (upstreamStatus >= 400 && upstreamStatus < 500) return upstreamStatus;
+  return 502;
+}
+
+const UPSTREAM_STATUS_HINT = {
+  401: "上游拒绝了账号凭据（401）。请在控制台「账号」页重新登录，或检查 refreshToken 是否已失效。",
+  403: "上游拒绝了本次请求（403）。常见原因是账号风控或模型不在该账号可用范围内，可在「上游渠道」页探测该模型。",
+  402: "该模型需要付费余额（402）。请改用免费通道（模型名以 cline-free/ 或带 :free 后缀），或在「账号」页查看余额。",
+  404: "上游没有这个模型（404）。请在「模型」页确认模型 ID 是否存在。",
+};
+
+function upstreamErrorResponse(status, errText) {
+  const clientStatus = clientStatusForUpstream(status);
+  const body = String(errText || "").slice(0, 500);
+  const hint = UPSTREAM_STATUS_HINT[status];
+  return jsonResponse({
+    error: {
+      message: "upstream error: " + body + (hint ? "\n" + hint : ""),
+      type: "api_error",
+      upstream_status: status,
+    },
+  }, clientStatus);
+}
+
+// 记一次上游失败，供控制台展示（不影响调度）
+function recordUpstreamFailure(status, errText) {
+  const kind = status === 429 ? "额度/限流"
+    : (status === 401 || status === 403) ? "凭据/风控"
+    : status === 402 ? "余额不足"
+    : "HTTP " + status;
+  console.log("[upstream] " + kind + "：" + String(errText || "").slice(0, 200));
+}
+
+// system prompt 覆盖：配了 overridePrompt 时替换客户端传来的 system 消息。
+//
+// 与参考实现的 override.md 同一用途，但这里是设置项而不是文件——云端没有可写
+// 磁盘，而且控制台里改一处比让用户去容器里挂载文件方便得多。
+function applyOverridePrompt(messages) {
+  const override = String(runtimeState.overridePrompt || "").trim();
+  const list = Array.isArray(messages) ? messages.slice() : [];
+  if (!override) return list;
+  const isSystem = (m) => m && typeof m === "object" &&
+    String(m.role || "").toLowerCase() === "system";
+  // 覆盖值放在原 system 消息的位置；客户端本来没有 system 消息时放到最前面
+  // （system 惯例在最前，放后面会被多数上游当成普通上下文）。
+  const at = Math.max(list.findIndex(isSystem), 0);
+  const rest = list.filter((m) => !isSystem(m));
+  // at 是原列表里的下标，剔除 system 后要换算成 rest 里的等价位置：
+  // 原下标之前有几个 system 就往前挪几位。
+  const before = list.slice(0, at).filter(isSystem).length;
+  rest.splice(Math.max(at - before, 0), 0, { role: "system", content: override });
+  return rest;
+}
 
 // ---------------------------------------------------------------------------
 // OpenAI 协议
@@ -1258,23 +3161,26 @@ async function handleChat(request, env) {
 
   let params;
   try {
-    params = await request.json();
+    params = await readJsonBody(request);
   } catch (e) {
-    return jsonResponse({ error: { message: "Invalid JSON body", type: "parse_error" } }, 400);
+    return bodyErrorResponse(e);
   }
 
   const isStream = !!params.stream;
   const sessionId = "sess_" + Date.now();
-  const model = params.model || DEFAULT_MODEL;
-  const modelConfig = (await refreshModels()).find((m) => m.id === model);
-  const upstreamModel = modelConfig?.upstream || model;
+  const requestedModel = params.model || defaultModelId();
+  // 上游模型 ID：优先取控制台里配的重定向，否则原样透传。
+  // 注意**不校验**它是否在启用列表里——启用列表是"发现过滤器"（决定 /v1/models
+  // 列什么），不是访问控制。写死模型 ID 的客户端不该因为没在面板里点过就失败。
+  const cfg = lookupModelUpstream(requestedModel);
+  const upstreamModel = (cfg && cfg.redirect) || requestedModel;
 
   // 构造上游 body（外部模型 ID 与 Cline 上游模型 ID 分离）
   const body = {
     model: upstreamModel,
     session_id: sessionId,
     reasoning_effort: params.reasoning_effort || params.reasoningEffort || "high",
-    messages: params.messages || [],
+    messages: applyOverridePrompt(params.messages || []),
   };
   // ⚠️ 上游风控: 免费模型请求体带 max_tokens 字段一律 500 "empty response content"，
   //    剥掉该字段再转发（max_tokens 不影响生成本质，只影响客户端显示）。
@@ -1287,31 +3193,36 @@ async function handleChat(request, env) {
   for (const k of ["temperature", "top_p", "tools", "tool_choice", "stop", "presence_penalty", "frequency_penalty", "response_format", "user", "n", "seed"]) {
     if (params[k] !== undefined) body[k] = params[k];
   }
+  // 上游渠道钉住与模型重定向。放在客户端字段透传**之后**，这样面板里配置的偏好
+  // 优先于客户端传进来的同名键——否则任意持有 API Key 的调用者都能覆盖后台路由。
+  applyUpstreamPrefs(body, requestedModel);
 
+  const signal = request.signal;
   try {
-    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, upstreamModel, 4, signal);
     if (!resp.ok) {
-      const errText = await resp.text();
-      return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
+      const errText = await resp.text().catch(() => "");
+      recordUpstreamFailure(resp.status, errText);
+      return upstreamErrorResponse(resp.status, errText);
     }
     if (isStream) {
       // 客户端要流式：直接透传 SSE
-      return streamResponse(resp, model);
+      return streamResponse(resp, requestedModel);
     }
     if (forceStream) {
       // 客户端要非流式 + 上游是流式：聚合 chunks 再返回
       // ⚠️ 免费通道(deepseek/cline-free)会概率性返回「HTTP200但content全程为空」的流
       //    （100个chunk全是reasoning，无正式content）。这里做内容检测：空则切号重试。
-      const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
+      const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, upstreamModel, resp, signal);
       if (retried.error) return retried.error;
-      retried.data.model = model;
+      retried.data.model = requestedModel;
       return jsonResponse(retried.data, 200);
     }
     // 非流式 + 非 deepseek：原逻辑
     const raw = await resp.json();
     const normalized = unwrapData(raw);
     recordUsage(resp, normalized?.usage, { model: upstreamModel });
-    normalized.model = model;
+    normalized.model = requestedModel;
     return jsonResponse(normalized, 200);
   } catch (e) {
     return errorResponse(e);
@@ -1322,18 +3233,18 @@ async function handleChat(request, env) {
 // 用于"客户端要非流式，但上游只能流式"的情况（deepseek 免费通道）
 // 额外处理：上游 200 但 content 全空（只有 reasoning）→ 视为坏响应，切号重试
 // 由调用方传入"已获取的上游响应"，这里负责聚合 + content 检测 + 空则重试。
-async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstResp) {
+async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, modelId, firstResp, signal) {
   const maxAttempts = 3; // 最多试 3 次（覆盖多账号切换）
   let lastData = null;
   let resp = firstResp;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     if (!resp) {
       // 需要重新发起上游请求（空响应重试时）
-      resp = await clineFetchWithRetry(env, path, bodyObj, sessionId, true);
+      resp = await clineFetchWithRetry(env, path, bodyObj, sessionId, modelId, 4, signal);
     }
     if (!resp.ok) {
       const errText = await resp.text().catch(() => "");
-      return { error: jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status) };
+      return { error: upstreamErrorResponse(resp.status, errText) };
     }
     const ct = resp.headers.get("content-type") || "";
     let normalized = null;
@@ -1365,21 +3276,25 @@ async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstRes
     if (content && !isReasoningFallback) {
       return { data: normalized }; // 有正式 content → 好响应
     }
-    // content 为空（或只有兜底 reasoning）：如果只有 reasoning，标记当前账号冷却并重试
+    // content 为空（或只有兜底 reasoning）：如果只有 reasoning，标记当前账号的
+    // 「该模型」冷却并重试。
+    // 只冷却这个组合而不是整个账号：空响应是上游对「这个模型」的限流表现，
+    // 同账号的其它模型往往是好的，整号冷却会白扔掉可用额度。
     if (reasoning || isReasoningFallback) {
       if (currentAccount) {
-        currentAccount.cooldownUntil = Date.now() + 30 * 1000; // 短冷却 30s
-        currentAccount.cooldownReason = "empty";
+        const info = { kind: "empty", detail: "HTTP 200 但 content 全程为空（仅 reasoning）", resetsAt: 0 };
+        markCooldown(accountId(currentAccount), currentAccount.email, modelId, 30 * 1000, info);
         currentAccount.accessToken = null;
         currentAccount.expiry = 0;
-        console.log(`[empty-content] 账号 ${attempt} 返回空 content，冷却 30s，重试第 ${attempt + 2} 次`);
+        console.log("[empty-content] " + (currentAccount.email || "账号") + " × " + modelId +
+          " 返回空 content，冷却 30s，重试第 " + (attempt + 2) + " 次");
       }
       await sleep(300 + Math.floor(Math.random() * 300));
       resp = null; // 下次循环重新请求（切到下一个号）
       continue;
     }
     // 完全空（连 reasoning 都没有）→ 也重试
-    console.log(`[empty-response] 账号 ${attempt} 完全空响应，重试第 ${attempt + 2} 次`);
+    console.log("[empty-response] 第 " + (attempt + 2) + " 次重试：上游完全空响应");
     await sleep(300 + Math.floor(Math.random() * 300));
     resp = null;
   }
@@ -1468,16 +3383,17 @@ async function handleAnthropic(request, env) {
 
   let req;
   try {
-    req = await request.json();
+    req = await readJsonBody(request);
   } catch (e) {
-    return jsonResponse({ error: { message: "Invalid JSON body", type: "parse_error" } }, 400);
+    return bodyErrorResponse(e);
   }
 
   const isStream = !!req.stream;
   const sessionId = "sess_" + Date.now();
-  const requestedModel = req.model || DEFAULT_MODEL;
-  const modelConfig = (await refreshModels()).find((m) => m.id === requestedModel);
-  const upstreamModel = modelConfig?.upstream || requestedModel;
+  const requestedModel = req.model || defaultModelId();
+  const upCfg = lookupModelUpstream(requestedModel);
+  // 同 handleChat：上游模型 ID 只应用控制台配的重定向，不校验是否在启用列表里
+  const upstreamModel = (upCfg && upCfg.redirect) || requestedModel;
 
   // Anthropic → OpenAI 消息转换
   const messages = [];
@@ -1494,7 +3410,7 @@ async function handleAnthropic(request, env) {
     model: upstreamModel,
     session_id: sessionId,
     reasoning_effort: "high",
-    messages,
+    messages: applyOverridePrompt(messages),
   };
   // ⚠️ 上游风控: 免费模型请求体带 max_tokens 字段一律 500，剥离（同 chat/completions 路径）
   // ⚠️ 免费 DeepSeek 通道：非流式被上游限流，强制上游 stream 再聚合
@@ -1508,12 +3424,16 @@ async function handleAnthropic(request, env) {
       function: { name: t.name, description: t.description || "", parameters: t.input_schema || {} },
     }));
   }
+  // 上游渠道钉住（同 OpenAI 路径，放在客户端字段之后）
+  applyUpstreamPrefs(body, requestedModel);
 
+  const signal = request.signal;
   try {
-    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, true);
+    const resp = await clineFetchWithRetry(env, "/chat/completions", body, sessionId, upstreamModel, 4, signal);
     if (!resp.ok) {
-      const errText = await resp.text();
-      return jsonResponse({ error: { message: "upstream error: " + errText.slice(0, 300), type: "api_error" } }, resp.status);
+      const errText = await resp.text().catch(() => "");
+      recordUpstreamFailure(resp.status, errText);
+      return upstreamErrorResponse(resp.status, errText);
     }
     if (isStream) {
       // 上游是 OpenAI SSE，转成 Anthropic SSE 格式
@@ -1522,7 +3442,7 @@ async function handleAnthropic(request, env) {
     if (forceStream) {
       // 客户端要非流式 + 上游是流式：聚合后再转 Anthropic
       // ⚠️ 同样做 content 检测：免费通道会概率性返回"200但content全空"的流，空则切号重试
-      const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, resp);
+      const retried = await nonStreamWithContentCheck(env, "/chat/completions", body, sessionId, upstreamModel, resp, signal);
       if (retried.error) return retried.error;
       return jsonResponse(openAItoAnthropic(retried.data), 200);
     }
@@ -1592,10 +3512,26 @@ async function streamResponse(upstream, externalModel) {
         }
       }
     } catch (e) {
-      // ignore
+      // 上游中途断开（连接被重置、超时、客户端取消）：必须发一个 error chunk 再结束。
+      // 旧实现只 break，客户端拿不到任何错误信号，只能等连接关闭才察觉，
+      // 看起来就像「回答被莫名截断」——比报错更难排查。
+      //
+      // 客户端自己取消时（signal.aborted）不发 error chunk：对方已经不在了，
+      // 写进去只会得到一个 "write after cancel" 的噪音异常。
+      const aborted = e && (e.name === "AbortError" || String(e.message || "").includes("client_aborted"));
+      if (!aborted) {
+        console.log("[stream] 上游流中断：" + String((e && e.message) || e));
+        try {
+          const msg = {
+            error: { message: "upstream stream failed: " + String((e && e.message) || e), type: "upstream_error" },
+          };
+          await writer.write(encoder.encode("data: " + JSON.stringify(msg) + "\n\n"));
+        } catch (writeErr) { /* 客户端已断开，无法投递 */ }
+      }
     } finally {
       // 客户端提前断开也会走到这里：那时 rawUsage 为 null，记一笔 missing
       recordUsage(upstream, rawUsage, { model: externalModel });
+      releaseUpstream(upstream);
       try { await writer.close(); } catch {}
     }
   })();
@@ -1773,9 +3709,25 @@ async function streamResponseAnthropic(upstream, externalModel) {
       });
       await send("message_stop", { type: "message_stop" });
     } catch (e) {
+      // 上游中途断开：必须发 error 事件，并且**不能**再补一套「正常结束」的收尾
+      // 事件——否则客户端会把被截断的回答当成模型主动结束（这是最坏的结果：
+      // 静默的错误数据比报错危险得多）。
+      //
+      // Anthropic 的 SSE 里中途出错用 event: error，而不是塞进 message_delta。
+      const aborted = e && (e.name === "AbortError" || String(e.message || "").includes("client_aborted"));
+      if (!aborted) {
+        console.log("[stream] Anthropic 转换中断：" + String((e && e.message) || e));
+        try {
+          await send("error", {
+            type: "error",
+            error: { type: "upstream_error", message: "upstream stream failed: " + String((e && e.message) || e) },
+          });
+        } catch (sendErr) { /* 客户端已断开，无法投递 */ }
+      }
     } finally {
       // 无论正常结束还是客户端提前断开都记一笔（断开时 rawUsage 为 null → missing）
       recordUsage(upstream, rawUsage, { model: externalModel });
+      releaseUpstream(upstream);
       try { await writer.close(); } catch {}
     }
   })();
@@ -1837,31 +3789,274 @@ function openAItoAnthropic(openAI) {
 // 辅助
 // ---------------------------------------------------------------------------
 
+// GET /v1/models
+//
+// ⚠️ 只回**控制台里启用的模型**（effectiveModelIds）：没启用过任何模型时回退到内置
+// 推荐，所以全新实例也不会拿到空列表。
+//
+// 这是"发现过滤器"而不是访问控制：chat 端点不校验模型是否在列表里，写死模型 ID
+// 的客户端照常可用。目的是"别让客户端看到四百多个挑不过来的模型"，不是代理 API 的门。
 async function handleModels() {
-  const list = await refreshModels();
-  const payload = list.map((m) => ({
-    id: m.id,
-    object: "model",
-    created: Math.floor(Date.now() / 1000),
-    owned_by: "cline",
-    // 附加字段（非 OpenAI 标准，普通客户端会忽略）：
-    // 正常路径下列表只放行确定免费的模型（:free 后缀或 FREE_WHITELIST），所以
-    // cost 恒为 "free"；channel 标明这个"免费"是哪来的，便于排查：
-    //   free        官方 recommended-models 的 free 数组
-    //   recommended 官方 recommended 数组（也走免费额度）
-    //   verified    官方分类未覆盖、人工实测确认免费（FREE_WHITELIST）
-    //   free-suffix 仅靠 :free 后缀进来的
-    // 注意：上游拉取失败会回退内置 MODELS，其中含 cline-pass 项，故 free 需按
-    // cost 实际取值计算，不能硬编码 true。
-    cost: m.cost || "free",
-    free: (m.cost || "free") === "free",
-    channel: m.channel || null,
-    label: m.label || null,
-    // 上游的原始 ID：~ 别名会被去掉波浪号后再对外，这里保留原名便于排查
-    upstream: m.upstream || m.id,
-    alias: !!m.alias,
-  }));
+  const ids = effectiveModelIds();
+  const payload = ids.map((id) => {
+    const remote = findRemoteModel(id);
+    return {
+      id,
+      object: "model",
+      created: Math.floor(Date.now() / 1000),
+      owned_by: normalizeModelId(id).split("/")[0] || "cline",
+      // 附加字段（非 OpenAI 标准，普通客户端会忽略）。
+      // 上游清单不保证已抓过，所以这些字段可能为 null —— 不假装知道。
+      label: (remote && remote.name) || null,
+      context_length: (remote && remote.context_length) || null,
+      is_default: id === defaultModelId(),
+    };
+  });
   return jsonResponse({ object: "list", data: payload }, 200, { "X-Cline2api-Version": VERSION });
+}
+
+// ---------------------------------------------------------------------------
+// 模型库接口（控制台用）
+// ---------------------------------------------------------------------------
+
+// GET /v1/models/library — 推荐分组 + 已启用清单
+// GET /v1/models/catalog — 上游全部模型（按供应商分组）
+//
+// 两个分开的理由：推荐清单只有二十几条、面板一打开就要显示；全部模型有四百多条、
+// 上游响应约 500 KB，只在用户展开折叠块时才拉。
+async function handleModelLibrary(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  if (request.method !== "GET") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  const url = new URL(request.url);
+  const force = url.searchParams.get("refresh") === "1";
+  const kind = url.pathname.endsWith("/catalog") ? "catalog" : "library";
+
+  try {
+    if (kind === "catalog") {
+      const res = await catalogSnapshot(force);
+      return jsonResponse({
+        ok: true,
+        groups: groupCatalogModels(res.models),
+        total: res.models.length,
+        fetched_at: res.fetchedAt,
+        cached: res.cached,
+        stale: res.stale,
+        error: res.error || null,
+      }, 200, { "Cache-Control": "no-store" });
+    }
+    const res = await recommendedSnapshot(force);
+    return jsonResponse({
+      ok: true,
+      groups: res.groups.map((g) => ({
+        ...g,
+        meta: RECOMMENDED_GROUP_META[g.key] || { title: g.key, sub: "", color: "var(--ink-2)" },
+      })),
+      fetched_at: res.fetchedAt,
+      cached: res.cached,
+      stale: res.stale,
+      error: res.error || null,
+    }, 200, { "Cache-Control": "no-store" });
+  } catch (e) {
+    // 完全没有数据（首次就回源失败）：502 让面板能区分"上游挂了"和"还没有数据"
+    return jsonResponse({
+      error: { message: String((e && e.message) || e), type: "model_library_error" },
+    }, 502, { "Cache-Control": "no-store" });
+  }
+}
+
+// GET /v1/models/enabled — 已启用模型（带展示元信息）
+async function handleModelEnabled(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  if (request.method !== "GET") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  const ids = effectiveModelIds();
+  return jsonResponse({
+    ok: true,
+    models: ids.map(modelView),
+    // 给前端区分「用户真的启用过」与「回退到内置推荐」——界面上的提示语不一样
+    using_builtin: enabledModels().length === 0,
+    default_model: defaultModelId(),
+  }, 200, { "Cache-Control": "no-store" });
+}
+
+// POST /v1/models/batch  {"ids":[...]} —— 批量启用
+//
+// 整批一次落盘：面板的「全部添加」一个分组可能有近百个模型，逐个落盘就是上百次
+// 整文件写（每次都要序列化全部状态），期间所有请求都要排队。
+//
+// 已存在的 ID 计入 skipped 而不是报错，因此「全部添加」可以安全地重复点击。
+async function handleModelBatchAdd(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+  const ids = Array.isArray(body.ids) ? body.ids : null;
+  if (!ids || !ids.length) {
+    return jsonResponse({ error: { message: "ids 不能为空", type: "model_error" } }, 400);
+  }
+  if (ids.length > MAX_BATCH_MODEL_IDS) {
+    return jsonResponse({
+      error: { message: "一次最多添加 " + MAX_BATCH_MODEL_IDS + " 个（收到 " + ids.length + "）", type: "model_error" },
+    }, 400);
+  }
+  const res = addModelIds(ids);
+  if (res.added.length) scheduleStateFlush();
+  return jsonResponse({
+    ok: true,
+    added: res.added,
+    skipped: res.skipped,
+    failed: res.failed,
+    models: effectiveModelIds().map(modelView),
+  }, 200);
+}
+
+// POST /v1/models/delete  {"id":"..."} —— 移除一个已启用模型
+async function handleModelDelete(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+  const id = normalizeExistingModelId(body.id);
+  if (!id) return jsonResponse({ error: { message: "缺少 id", type: "model_error" } }, 400);
+  if (!removeModelId(id)) {
+    return jsonResponse({ error: { message: "该模型不在启用列表里：" + id, type: "model_error" } }, 404);
+  }
+  scheduleStateFlush();
+  return jsonResponse({
+    ok: true,
+    message: "已移除 " + id,
+    models: effectiveModelIds().map(modelView),
+    default_model: defaultModelId(),
+  }, 200);
+}
+
+// POST /v1/models/default  {"id":"..."} —— 设为默认模型
+async function handleModelSetDefault(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+  const id = normalizeExistingModelId(body.id);
+  if (!id) return jsonResponse({ error: { message: "缺少 id", type: "model_error" } }, 400);
+  if (!isModelEnabled(id)) {
+    return jsonResponse({
+      error: { message: "只能把已启用的模型设为默认：" + id, type: "model_error" },
+    }, 400);
+  }
+  runtimeState.defaultModel = id;
+  scheduleStateFlush();
+  return jsonResponse({
+    ok: true,
+    message: "已把 " + id + " 设为默认模型",
+    default_model: id,
+    models: effectiveModelIds().map(modelView),
+  }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// 模型可用性检测
+//
+// 与上游渠道探测是两件事，所以分开：
+//   探测（probe）  判管道归属、枚举渠道清单 —— 读响应**元数据与错误体**
+//   检测（check）  只回答"这个模型现在能不能用" —— 发最短的文本请求看有没有正常回答
+//
+// 复用同一套异步任务存储（去重 + 并发上限 + 过期淘汰），因为交互形态完全一样：
+// 都要打上游、都可能慢，同步返回会让面板转圈到超时。
+// ---------------------------------------------------------------------------
+async function modelCheckRun(modelId) {
+  const upstreamModel = upstreamModelId(modelId);
+  const body = probeRequestBody(upstreamModel, PROBE_MAX_TOKENS);
+  body.messages = [{ role: "user", content: "Reply with only OK." }];
+  applyUpstreamPrefs(body, modelId);
+  const start = Date.now();
+  const res = await upstreamProbeCall(upstreamModel, body, 90000);
+  if (res.status !== 200) {
+    // 状态码 → 人能看懂的原因。这条信息直接显示在卡片上，所以要说清"该去做什么"，
+    // 而不是把 HTTP 码丢给用户自己猜。
+    const reason = res.status === 401 || res.status === 403 ? "当前账号认证失败或无权访问此模型"
+      : res.status === 402 ? "当前账号额度或订阅不足"
+      : res.status === 404 ? "模型或可用渠道不存在"
+      : res.status === 429 ? "当前账号或模型受到限流，请稍后重试"
+      : "上游请求失败";
+    return { ok: false, kind: "http", text: reason + "（HTTP " + res.status + "）", latencyMs: Date.now() - start };
+  }
+  // HTTP 200 不足以证明可用：上游会返回"200 但 content 全空"（只有 reasoning）。
+  // 这种情况在实际使用中等于不可用，所以必须校验正文。
+  const d = res.json ? unwrapUpstream(res.json) : null;
+  const choice = d ? firstChoice(d) : null;
+  const content = choice && choice.message && typeof choice.message.content === "string"
+    ? choice.message.content.trim() : "";
+  if ((res.json && res.json.error) || (d && d.error) || !content) {
+    return {
+      ok: false, kind: "empty",
+      text: "未获得有效文本回答，暂不能确认可用（可能是上游异常或输出预算不足）",
+      latencyMs: Date.now() - start,
+    };
+  }
+  return { ok: true, kind: "ok", text: "可用 · 首字节 " + (Date.now() - start) + "ms", latencyMs: Date.now() - start };
+}
+
+async function handleModelCheck(request, env) {
+  const auth = getApiKey(request, env);
+  if (!auth.ok) return authError(auth.reason);
+
+  if (request.method === "GET") {
+    const id = new URL(request.url).searchParams.get("jobId") || "";
+    const job = probeJobs.get(id);
+    if (!job) {
+      return jsonResponse({
+        error: { message: "检测任务已过期或服务已重启，请重新检测", type: "model_error" },
+      }, 404, { "Cache-Control": "no-store" });
+    }
+    return jsonResponse({ ok: true, job }, 200, { "Cache-Control": "no-store" });
+  }
+  if (request.method !== "POST") {
+    return jsonResponse({ error: { message: "method not allowed", type: "model_error" } }, 405);
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch (e) {
+    return bodyErrorResponse(e);
+  }
+  const v = validateModelId(body.id || body.model_id);
+  if (!v.ok) return jsonResponse({ error: { message: v.error, type: "model_error" } }, 400);
+
+  const started = startProbeJob(v.id, modelCheckRun, "check");
+  if (started.error) {
+    return jsonResponse({ error: { message: started.error, type: "model_error" } },
+      started.status, { "Retry-After": "2" });
+  }
+  return jsonResponse({
+    ok: true, job: started.job, shared: started.shared,
+    message: started.shared ? "该模型已有一次检测在进行，共享其结果" : "检测已开始",
+  }, 202, { "Cache-Control": "no-store" });
 }
 
 // 鉴权：fail-closed
@@ -2038,6 +4233,12 @@ body::after {
 }
 .cell.live { border-color:var(--ok); color:var(--ok); background:var(--ok-soft); }
 .cell.cool { border-color:var(--warn); color:var(--warn); background:var(--warn-soft); }
+/* part：账号可用，只有部分模型在冷却。用左半填充表示「一半」，
+   与整格告警色的 cool 区分开——否则用户会以为这个号完全用不了。 */
+.cell.part {
+  border-color:var(--line); color:var(--ink-2);
+  background-image:linear-gradient(135deg,var(--warn-soft) 0 50%,transparent 50% 100%);
+}
 .cell.tmp { box-shadow:inset 0 -3px 0 var(--accent); }
 .pool .empty { font-size:11px; color:var(--ink-3); line-height:1.5; }
 
@@ -2188,6 +4389,9 @@ details.rz pre{
 }
 .acct.live{ border-color:var(--ok); }
 .acct.cool{ border-color:var(--warn); }
+/* warn：账号本身可用，只是部分模型在冷却 —— 与「整号不可用」用不同边框区分，
+   否则用户会以为这个号完全用不了 */
+.acct.warn{ border-color:var(--line); }
 .acct.off{ border-color:var(--line); }
 .acct.off .hd .who .ml{ color:var(--ink-3); }
 
@@ -2199,6 +4403,7 @@ details.rz pre{
 }
 .acct.live .ix{ border-color:var(--ok); color:var(--ok); }
 .acct.cool .ix{ border-color:var(--warn); color:var(--warn); }
+.acct.warn .ix{ border-color:var(--line); color:var(--ink-2); }
 .acct .who{ min-width:0; flex:1; }
 .acct .who .ml{
   display:block; font-size:11.5px; color:var(--ink);
@@ -2214,6 +4419,7 @@ details.rz pre{
 .badge.live{ border-color:var(--ok); color:var(--ok); background:var(--ok-soft); }
 .badge.cool{ border-color:var(--warn); color:var(--warn); background:var(--warn-soft); }
 .badge.off{ border-color:var(--line); color:var(--ink-3); background:var(--inset); }
+.badge.part{ border-color:var(--line); color:var(--ink-2); background:var(--inset); }
 
 /* 数据区：双列小格 */
 .acct .kv{ display:grid; grid-template-columns:1fr 1fr; flex:1; align-content:start; }
@@ -2439,6 +4645,150 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
 .spd .h{ height:3px; background:var(--accent); } .spd .h.na{ background:var(--line); }
 .empty{ text-align:center; padding:32px 16px; color:var(--ink-3); font-size:12px; }
 
+/* ══ 弹窗（账号详情等）══
+   复用像素终端语言：直角、2px 描边、硬投影。 */
+.modal-bg{
+  position:fixed; inset:0; z-index:300; background:rgba(0,0,0,.6);
+  display:flex; align-items:center; justify-content:center; padding:20px;
+}
+.modal{
+  background:var(--surface); border:2px solid var(--line); box-shadow:var(--shadow-lg);
+  width:min(880px,100%); max-height:calc(100vh - 40px); display:flex; flex-direction:column;
+}
+.modal > header{
+  display:flex; align-items:center; gap:9px; padding:10px 13px;
+  border-bottom:2px solid var(--line); background:var(--surface-2); flex:none;
+}
+.modal > header h3{ font-size:12.5px; font-weight:700; }
+.modal > .pad{ overflow-y:auto; }
+/* 弹窗内的表格不要用页面级的高度限制，按内容自然撑开由弹窗滚动 */
+.tblwrap.tblfixed{ max-height:none; min-height:0; }
+h4.mh{
+  font-size:11px; color:var(--ink-3); letter-spacing:.06em; text-transform:uppercase;
+  margin:15px 0 7px; padding-bottom:5px; border-bottom:1px solid var(--line-soft);
+}
+h4.mh:first-child{ margin-top:0; }
+.kv2{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:9px; }
+.kv2 > div{ background:var(--surface-2); border:2px solid var(--line-soft); padding:8px 10px; }
+.kv2 .k{ display:block; font-size:10px; color:var(--ink-3); letter-spacing:.05em; margin-bottom:3px; }
+.kv2 .v{ font-size:12px; font-variant-numeric:tabular-nums; }
+.kv2 .v.ok{ color:var(--ok); }
+code.chiplite{
+  display:inline-block; font-family:var(--mono); font-size:10.5px; padding:2px 7px;
+  border:1px solid var(--line-soft); color:var(--ink-2); background:var(--surface-2); margin:0 4px 4px 0;
+}
+.modal .desc{ font-size:11px; color:var(--ink-3); margin-bottom:7px; }
+
+/* ══ 模型库（三段式：推荐分组 / 全部模型 / 已启用）══
+   布局对齐 Go 版 cline-proxy 的模型库，但视觉沿用本项目的像素终端语言：
+   直角、2px 描边、硬投影、等宽字体（不搬他的圆角徽章与彩色圆点）。 */
+.mgroup{ border-top:2px solid var(--line-soft); padding-top:11px; margin-top:13px; }
+.mgroup:first-child{ border-top:none; padding-top:0; margin-top:0; }
+.mghead{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:9px; }
+.mghead h4{ font-size:12px; font-weight:700; }
+/* 分组色点：8px 方块而非圆点，与全站的直角语言一致 */
+.gdot{ width:8px; height:8px; flex:none; }
+.mghead .gsub{ font-size:10.5px; color:var(--ink-3); }
+.mghead .note{ font-size:10.5px; color:var(--ink-3); }
+
+.mcards{ display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:8px; }
+.mcard{
+  border:2px solid var(--line-soft); background:var(--surface-2);
+  padding:7px 9px; min-width:0;
+}
+.mcard.on{ border-color:var(--ok); background:var(--ok-soft); }
+.mcard.def{ border-color:var(--accent); }
+/* 卡片内容分两行：第一行是名字（可省略），第二行是操作按钮。
+   按钮单独一行是必需的 —— 挤在同一行时 flex 会把按钮压到逐个字符换行
+   （"检测" 变成竖排的"检/测"），而模型名也会被压到只剩几个字。 */
+.mcard .mrow{ display:flex; align-items:center; gap:7px; min-width:0; }
+.mcard .macts{ display:flex; align-items:center; gap:6px; margin-top:6px; flex-wrap:wrap; }
+/* nowrap 是这套按钮的硬要求：短标签（检测/移除）绝不该折成两行 */
+.mcard button{ white-space:nowrap; flex:none; }
+.mcard .mname{
+  font-size:11.5px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  min-width:0;
+}
+.mcard .mid{
+  font-size:10px; color:var(--ink-3); font-family:var(--mono);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  flex:1 1 auto; min-width:0;
+}
+.mcard .grow{ flex:1; }
+/* 上下文长度与 tags：小方块标签，不用圆角 */
+.mcard .mctx{
+  flex:none; font-size:9.5px; padding:2px 6px; color:var(--ink-2);
+  border:1px solid var(--line); font-variant-numeric:tabular-nums;
+}
+.mcard .mtag{
+  flex:none; font-size:9.5px; padding:2px 6px; color:var(--accent);
+  border:1px solid var(--accent);
+}
+/* 状态徽章（默认）与上下文/标签同一行，留出左边距免得贴在模型名上 */
+.mcard .badge{ flex:none; margin-left:2px; }
+.mcard .mchk{ font-size:10.5px; margin-top:5px; padding-top:4px; border-top:1px solid var(--line-soft); }
+.mcard .mchk.ok{ color:var(--ok); }
+.mcard .mchk.bad{ color:var(--bad); }
+/* 描述默认收起（几百张卡片全铺开描述会把页面撑得没法看），由「显示描述」开关控制 */
+.mcard .mdesc{ display:none; font-size:10.5px; color:var(--ink-3); line-height:1.6; margin-top:5px; }
+body.show-mdesc .mcard .mdesc{ display:block; }
+
+/* 全部模型：折叠块 + 搜索条 */
+.fold{ border:2px solid var(--line-soft); }
+.foldsum{
+  display:flex; align-items:center; gap:9px; cursor:pointer; list-style:none;
+  padding:10px 13px; background:var(--surface-2); user-select:none;
+}
+/* 隐藏 <summary> 的原生三角。三行都要写：::-webkit-details-marker 只对 WebKit 生效，
+   这个浏览器引擎认的是 list-style（上面那行）与 ::marker。少写一行就会多出一个
+   和自绘 chevron 并存的空方块。 */
+.foldsum::-webkit-details-marker{ display:none; }
+.foldsum::marker{ content:""; }
+.foldsum h3{ font-size:12.5px; font-weight:700; }
+/* 折叠标题右侧的计数是纯文本。刻意不复用 .note —— 那是个带 2px 边框的提示条组件，
+   空着的时候会渲染成一个小方块。 */
+.foldsum .fsub{ font-size:10.5px; color:var(--ink-3); }
+.foldsum .grow{ flex:1; }
+/* 展开指示：一个直角三角，用 CSS 边框画，不引图标 */
+.foldsum .chev{
+  flex:none; width:0; height:0; border-left:6px solid var(--ink-3);
+  border-top:5px solid transparent; border-bottom:5px solid transparent;
+  transition:transform .15s;
+}
+details[open] > .foldsum .chev{ transform:rotate(90deg); }
+details.fold > .pad{ border-top:2px solid var(--line); }
+.msearch{ display:flex; align-items:center; gap:9px; margin-bottom:11px; flex-wrap:wrap; }
+.msearch input{ flex:1; min-width:220px; }
+.msearch .note{ font-size:10.5px; color:var(--ink-3); white-space:nowrap; }
+
+/* ══ 上游渠道面板 ══ */
+.upadd{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+.upadd input{ flex:1; min-width:240px; }
+.upcard{ margin-bottom:13px; }
+.upcard header .badge{ flex:none; }
+.upbody{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:11px; padding:11px 13px; }
+.upbody .full{ grid-column:1/-1; }
+.upbody label.lb{ margin-bottom:4px; }
+.upbody textarea{ min-height:56px; }
+.upmeta{ font-size:10.5px; color:var(--ink-3); line-height:1.7; }
+.upmeta code{ font-family:var(--mono); color:var(--ink-2); }
+/* 探测结果条：管道归属 + 实际命中渠道，一眼看出钉住生效没有 */
+.probe{ border:2px solid var(--line-soft); background:var(--surface-2); padding:9px 11px; font-size:11px; line-height:1.75; }
+.probe .row{ display:flex; gap:7px; flex-wrap:wrap; }
+.probe .k{ color:var(--ink-3); }
+.probe .ok{ color:var(--ok); }
+.probe .bad{ color:var(--bad); }
+.probe .warn{ color:var(--warn); }
+.probe .note{ margin-top:6px; color:var(--ink-2); border-top:1px solid var(--line-soft); padding-top:6px; }
+/* system prompt / 请求头表单 */
+.hdrgrid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:9px; }
+.hdrgrid > div{ display:flex; align-items:center; gap:8px; }
+.hdrgrid label{ flex:none; width:150px; font-size:11px; color:var(--ink-2); font-family:var(--mono);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.hdrgrid input{ flex:1; min-width:0; }
+.warnbox{ border:2px solid var(--warn); background:var(--warn-soft); color:var(--ink); padding:9px 11px; font-size:11.5px; line-height:1.7; }
+.okbox{ border:2px solid var(--ok); background:var(--ok-soft); padding:9px 11px; font-size:11.5px; }
+
 /* ══ 日志：固定高度滚动窗口 ══ */
 .logwrap{ flex:1; min-height:0; display:grid; grid-template-columns:1fr 340px; gap:0; }
 @media (max-width:1100px){ .logwrap{ grid-template-columns:1fr; } .logdetail{ border-left:none !important; border-top:2px solid var(--line); max-height:44vh; } }
@@ -2526,6 +4876,8 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
       <li><a data-v="usage"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 13.5h11"/><path d="M4.6 13.5V8.6M8 13.5V3.6M11.4 13.5V6.4"/></svg>统计<span class="cnt" id="cnt-usage"></span></a></li>
       <li><a data-v="logs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>日志<span class="cnt" id="cnt-log"></span></a></li>
       <li><a data-v="config"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>接入配置</a></li>
+      <li><a data-v="upstreams"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 4h4M9.5 4h4M2.5 12h4M9.5 12h4"/><circle cx="8" cy="4" r="1.6"/><circle cx="8" cy="12" r="1.6"/><path d="M8 5.6v4.8"/></svg>上游渠道<span class="cnt" id="cnt-up"></span></a></li>
+      <li><a data-v="settings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/><circle cx="5.5" cy="4.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="10.5" cy="8" r="1.5" fill="currentColor" stroke="none"/><circle cx="6.5" cy="11.5" r="1.5" fill="currentColor" stroke="none"/></svg>设置</a></li>
     </ul>
 
     <div class="pool">
@@ -2647,38 +4999,69 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
       </section>
 
       <!-- ── 模型 ── -->
+      <!-- ── 模型 ──
+           三段式布局（对齐 Go 版 cline-proxy 的模型库）：
+             ① 可用模型分组 —— 官方推荐/free/Pass/Cloud，卡片墙 + 整组添加
+             ② 全部模型     —— 折叠，展开才抓（上游 440+ 条、约 500 KB），按供应商分组
+             ③ 已启用模型   —— 真正会出现在 /v1/models 里的那些
+           卡片交互三处共用同一套渲染函数，格式与行为完全一致。 -->
       <section class="view" id="v-models" hidden>
         <div class="box">
           <header>
-            <h3>模型列表</h3>
+            <h3>模型库</h3>
             <span class="grow"></span>
-            <span class="note" id="mNote"></span>
-            <button class="xs ghost" id="btnReloadModels">重新拉取</button>
+            <span class="note" id="mStatus"></span>
+            <button class="xs ghost" id="mDescBtn" title="显示/隐藏上游的模型描述">显示描述</button>
+            <button class="xs ghost" id="mRefreshBtn">刷新数据</button>
           </header>
           <div class="pad">
-            <div class="mactions" style="margin-bottom:11px">
-              <div style="flex:1;min-width:170px"><label class="lb" for="mfilter">筛选模型 ID</label><input id="mfilter" placeholder="如 deepseek、qwen、:free"></div>
-              <label class="chk" style="padding-bottom:6px"><input type="checkbox" id="mfree" checked> 只看免费</label>
-              <label class="chk" style="padding-bottom:6px"><input type="checkbox" id="mcn"> 只看国产</label>
-              <button class="primary" id="btnTestAll" style="margin-bottom:1px">测试全部</button>
-              <button class="ghost" id="btnStopTest" style="margin-bottom:1px" hidden>停止</button>
+            <p class="desc">
+              数据来自 <code>api.cline.bot</code>（由服务端抓取 —— 浏览器直连会被 CORS 拦截）。
+              点分组标题右侧的「全部添加」可一键加入该组所有模型，点单个模型卡片上的 ＋ 单独添加；
+              重复添加会自动跳过。也可点「检测」先发一次小请求确认它现在能不能用（可能消耗少量额度）。
+            </p>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>可用模型分组</h3><span class="grow"></span><span class="note" id="mLibNote"></span></header>
+          <div class="pad" id="mLibrary">
+            <div class="empty">加载中…</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <details class="fold" id="mCatalogFold">
+            <summary class="foldsum">
+              <h3>全部模型</h3>
+              <span class="fsub" id="mCatNote"></span>
+              <span class="chev"></span>
+            </summary>
+            <div class="pad">
+              <p class="desc">
+                上游全部可选模型（含付费档），展开后才抓取，服务端缓存 30 分钟。
+                按供应商（模型 ID 里 <code>/</code> 前那一段）分组，每组标题右侧都能「全部添加」。
+              </p>
+              <div class="msearch">
+                <input type="search" id="mCatSearch" placeholder="搜索名称或 ID（如 gpt、qwen、flash）" autocomplete="off" spellcheck="false">
+                <span class="note" id="mCatCount"></span>
+              </div>
+              <div id="mCatalog"><div class="empty">展开后加载…</div></div>
             </div>
-            <div class="stats" id="mStats" style="margin-bottom:11px"></div>
-            <div class="bar" id="mBar" hidden style="margin-bottom:11px"><i></i></div>
-            <div class="tblwrap">
-              <table class="m">
-                <thead><tr>
-                  <th class="sort" data-s="region" style="width:9%">地区</th>
-                  <th class="sort" data-s="id" style="width:33%">模型 ID</th>
-                  <th style="width:9%">类型</th>
-                  <th class="sort" data-s="speed" style="width:16%">输出速度</th>
-                  <th class="sort" data-s="ttft" style="width:10%">首字节</th>
-                  <th style="width:23%"></th>
-                </tr></thead>
-                <tbody id="mRows"></tbody>
-              </table>
-            </div>
-            <div class="empty" id="mEmpty" hidden>没有符合条件的模型。</div>
+          </details>
+        </div>
+
+        <div class="box">
+          <header>
+            <h3>已启用模型</h3>
+            <span class="grow"></span>
+            <span class="note" id="mOwnNote"></span>
+          </header>
+          <div class="pad">
+            <p class="desc" id="mOwnHint">
+              只有这里的模型会出现在 <code>/v1/models</code> 里。点「移除」即可撤下。
+            </p>
+            <div id="mOwned"></div>
           </div>
         </div>
       </section>
@@ -2833,6 +5216,98 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
           </div>
         </div>
       </section>
+
+      <!-- ── 上游渠道 ──
+           按模型指定走哪条上游渠道。核心概念：Cline 网关后面有两条路由管道
+           （direct=OpenRouter / planner=Vercel Gateway），钉住的写法互不通用，
+           所以这里要么先探测、要么两种形式同时注入。 -->
+      <section class="view" id="v-upstreams" hidden>
+        <div class="box">
+          <header>
+            <h3>按模型钉住上游渠道</h3>
+            <span class="grow"></span>
+            <span class="note" id="upNote"></span>
+            <button class="xs ghost" id="btnUpReload">刷新</button>
+          </header>
+          <div class="pad">
+            <p class="desc">
+              留空 = 自动模式（由网关自己挑渠道并自带故障转移，实测最稳）。
+              钉住用于：某个渠道总是坏、要优先用便宜/快的渠道、或想把模型 ID 重定向到新名字。
+              <b>只有探测过才知道这个模型走哪条管道</b>，所以先点「探测」再钉。
+            </p>
+            <div class="upadd">
+              <input id="upModel" list="upModelList" placeholder="模型 ID，例如 cline-free/deepseek-v4.1-flash">
+              <datalist id="upModelList"></datalist>
+              <button class="primary" id="btnUpAdd">添加配置</button>
+            </div>
+          </div>
+        </div>
+        <div id="upList"></div>
+      </section>
+
+      <!-- ── 设置 ── -->
+      <section class="view" id="v-settings" hidden>
+        <div class="grid2">
+          <div class="box">
+            <header><h3>调度</h3></header>
+            <div class="pad">
+              <label class="lb" for="setStrategy">轮换策略</label>
+              <select id="setStrategy" style="margin-bottom:11px">
+                <option value="round_robin">round_robin — 逐个轮换（默认）</option>
+                <option value="fill">fill — 先用满一个号，再换下一个</option>
+                <option value="random">random — 随机挑一个</option>
+              </select>
+              <label class="lb" for="setCooldown">冷却兜底时长（分钟）</label>
+              <input id="setCooldown" type="number" min="1" max="1440" style="margin-bottom:4px">
+              <p class="desc">
+                只在上游<b>没有</b>给出重置时间时使用。上游给了就用上游的
+                （免费模型按自然日，自动算到次日本地零点）。
+                改这个值会清空现有冷却，让新配置立刻生效。
+              </p>
+              <label class="lb" for="setDefaultModel">默认模型</label>
+              <select id="setDefaultModel" style="margin-bottom:4px"></select>
+              <p class="desc">客户端请求里不带 <code>model</code> 字段时用它。</p>
+            </div>
+          </div>
+          <div class="box">
+            <header><h3>system prompt 覆盖</h3></header>
+            <div class="pad">
+              <textarea id="setOverride" rows="7" placeholder="留空 = 用客户端自己的 system 提示"></textarea>
+              <p class="desc" style="margin-top:8px">
+                填了就<b>替换</b>客户端传来的 system 消息（位置不变，内容换成这里填的）。
+                适用于给所有客户端统一注入一段行为约束。
+              </p>
+            </div>
+          </div>
+        </div>
+        <div class="box">
+          <header>
+            <h3>自定义请求头</h3>
+            <span class="grow"></span>
+            <button class="xs ghost" id="btnHdrReset">恢复默认</button>
+          </header>
+          <div class="pad">
+            <p class="desc">
+              上游靠这些头识别「是不是 Cline 客户端」，<b>改动有风险</b>：填错会被 403
+              （<code>only available via Cline product surfaces</code>）。
+              一般只在客户端版本升级、上游要求新版本号时才需要改。留空的行不生效。
+            </p>
+            <div class="hdrgrid" id="hdrGrid"></div>
+          </div>
+        </div>
+        <div class="box">
+          <header><h3>保存</h3></header>
+          <div class="pad">
+            <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+              <button class="primary" id="btnSetSave">保存设置</button>
+              <button class="ghost" id="btnSetReload">放弃改动并重新读取</button>
+              <span class="grow" style="flex:1"></span>
+              <span class="note" id="setNote"></span>
+            </div>
+            <div id="setPersist" style="margin-top:11px"></div>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -2877,16 +5352,28 @@ var VIEWS = {
   models:{t:"模型",s:"浏览模型，测延迟与输出速度"},
   usage:{t:"统计",s:"token 用量与重试放大"},
   logs:{t:"日志",s:"固定窗口滚动查看历史请求"},
+  upstreams:{t:"上游渠道",s:"按模型钉住上游渠道、重定向模型 ID"},
+  settings:{t:"设置",s:"轮换策略、冷却时长、请求头与 system 覆盖"},
   config:{t:"接入配置",s:"把服务接到你的客户端"}
 };
 
 var state = {
-  key:"", model:"", models:[], messages:[], chatStats:null,
+  key:"", model:"", messages:[], chatStats:null,
   stream:true, temp:"", topp:"", sys:"",
-  health:null, logs:[], filter:"all", search:"", sort:"region", sortDir:1,
-  testing:false, busy:false, abort:null, snip:"curl",
+  health:null, logs:[], filter:"all",
+  busy:false, abort:null, snip:"curl",
   login:null, loginTimer:null, follow:true, selId:null,
-  healthDown:false   // 上次健康检查是否失败（用于去重连接错误提示）
+  healthDown:false,   // 上次健康检查是否失败（用于去重连接错误提示）
+  hasDetail:false,    // /v1/status 是否读到了账号明细（没配 key 时为 false）
+  upstreams:[], upModels:[], config:null,
+  // 模型库
+  owned:[],           // 已启用模型（/v1/models 真正会返回的那些）
+  ownedBuiltin:false, // 是否处在「没启用过 → 回退内置推荐」的状态
+  mLibGroups:[],      // 推荐分组（面板打开就拉）
+  mCatalog:null,      // 全部模型分组（展开折叠块才拉）
+  mCatalogTotal:0,
+  mCatLoaded:false,
+  mchecks:{}          // 模型可用性检测的内存态（服务端不存，只回答"刚才能不能用"）
 };
 
 function save(k,v){ try{ localStorage.setItem(k, typeof v==="string"?v:JSON.stringify(v)); }catch(e){} }
@@ -3205,6 +5692,10 @@ function showTab(name){
   if(name==="logs") renderLogs();
   if(name==="accounts") renderAccts();
   if(name==="usage") renderUsage();
+  if(name==="upstreams") loadUpstreams();
+  // 模型页：已启用列表 + 推荐分组一起拉（推荐清单只有二十几条，够快）
+  if(name==="models"){ loadModelLibrary(false); loadOwnedModels(); }
+  if(name==="settings") loadSettings();
 }
 
 /* ══ 健康 / 账号池 ══ */
@@ -3213,21 +5704,31 @@ function renderHealth(h){
   var avail=h.accounts_available||0,total=h.account_count||0,det=h.account_details||[];
   var cells=$("poolCells");
   if(!total){ cells.innerHTML='<span class="empty">未配置账号</span>'; }
+  else if(!det.length){
+    // /v1/status 读不到明细（没填 API Key）：不画格子，免得让人以为账号是坏的
+    cells.innerHTML='<span class="empty">'+total+' 个账号（填写 API Key 后显示明细）</span>';
+  }
   else{
     cells.innerHTML=det.map(function(a){
-      var cls="cell "+(a.available?"live":(a.enabled?"cool":"off"))+(a.runtime?" tmp":"");
+      // 冷却已降到「账号×模型」粒度：格子只区分
+      //   可用 / 部分模型冷却 / 全部模型冷却 / 停用
+      var cms=a.cooldown_models||[];
+      // 用「已启用模型数」判断是不是整号冷却：那才是用户实际在用的模型集
+      var known=state.owned.length;
+      var allCooling=cms.length&&known&&cms.length>=known;
+      var cls="cell "+(a.enabled?(cms.length?(allCooling?"cool":"part"):"live"):"off")+(a.runtime?" tmp":"");
       var tip="账号 #"+(a.index+1);
       if(a.email) tip+="（"+a.email+"）";
-      tip+="：" +(!a.enabled?"已停用":(a.available?"可用":"冷却中"));
-      if(a.enabled&&!a.available&&a.cooldown_seconds){
-        tip+="，剩约 "+fmtDur(a.cooldown_seconds);
-        if(a.cooldown_reason==="limit") tip+="（额度用尽）";
-        else if(a.cooldown_reason==="empty") tip+="（空响应）";
-        else if(a.cooldown_reason==="auth") tip+="（鉴权失败）";
+      tip+="：" +(!a.enabled?"已停用":(cms.length?(allCooling?"全部模型冷却中":"部分模型冷却中"):"可用"));
+      if(a.enabled&&cms.length){
+        tip+="，共 "+cms.length+" 个模型受限，最长剩约 "+fmtDur(a.cooldown_seconds);
+        var lim=null;
+        for(var i=0;i<cms.length;i++){ if(cms[i].limited){ lim=cms[i]; break; } }
+        tip+="（"+coolLabel((lim||cms[0]).kind)+"）";
       }
-      if(a.runtime) tip+="，登录得到（重启会丢）";
+      if(a.runtime) tip+="，控制台登录（本地会自动存盘）";
       else if(a.token_cached) tip+="，token 已缓存";
-      var lb=!a.enabled?"–":(a.available?String(a.index+1):(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!"));
+      var lb=!a.enabled?"–":(cms.length?(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!"):String(a.index+1));
       return '<span class="'+cls+'" title="'+esc(tip)+'">'+esc(lb)+"</span>";
     }).join("");
   }
@@ -3312,6 +5813,11 @@ function goConfig(){ showTab("config"); $("key").focus(); }
 function goAccounts(){ showTab("accounts"); }
 
 function loadHealth(){
+  // 两个端点各司其职：
+  //   /v1/health 免鉴权、字段精简（只回答「服务在不在」）→ 用来判断连通性；
+  //   /v1/status 需要 API_KEY、带账号明细与冷却表 → 用来渲染账号池。
+  // 分开的原因：health 面向公网暴露（部署到云端时任何人都能读），账号邮箱
+  // 与用量不该出现在那里。
   return fetch("/v1/health",{cache:"no-store"})
     .then(function(r){
       if(!r.ok) throw new Error("服务返回 HTTP "+r.status);
@@ -3319,7 +5825,29 @@ function loadHealth(){
     })
     .then(function(h){
       if(state.healthDown){ state.healthDown=false; toast("ok","服务已恢复","已重新连上本地服务。"); }
+      // 先用手上的公共字段渲染一次（首屏与鉴权失败时的降级视图）
       renderHealth(h);
+      // 再拉带明细的完整状态；没配 key 或鉴权失败时保持上面的精简视图
+      return fetch("/v1/status",{cache:"no-store",headers:authHeaders()})
+        .then(function(r){ return r.ok?r.json():null; })
+        .catch(function(){ return null; })
+        .then(function(s){
+          if(s&&s.ok){
+            h.account_details=s.account_details||[];
+            h.account_count=s.account_count||0;
+            h.accounts_available=s.accounts_available||0;
+            h.runtime_accounts=s.runtime_accounts||0;
+            h.cooldowns=s.cooldowns||[];
+            h.cooldown_minutes=s.cooldown_minutes;
+            h.strategy=s.strategy;
+            h.default_model=s.default_model;
+            h.persisted=s.persisted;
+            state.hasDetail=true;
+          } else {
+            state.hasDetail=false;
+          }
+          renderHealth(h);
+        });
     })
     .catch(function(e){
       $("keySq").className="sq bad";
@@ -3347,10 +5875,15 @@ function diagHint(){
 /* ══ 账号页 ══ */
 
 // 冷却原因 → 中文说明。抽出来是因为卡片和概览都要用。
+// 冷却种类 → 中文标签。kind 来自上游 429 响应体的解析（见 worker.js parseLimitInfo）。
+// 注意 unknown 是「我们按配置时长猜的」，界面上要说成「未识别」而不是假装知道原因。
 function coolLabel(reason){
-  if(reason==="limit") return "额度用尽";
+  if(reason==="limit"||reason==="free_daily") return "免费日额度";
+  if(reason==="pass_limit") return "订阅额度";
+  if(reason==="spend_limit") return "花费上限";
   if(reason==="empty") return "空响应";
   if(reason==="auth") return "鉴权失败";
+  if(reason==="unknown") return "未识别";
   return "冷却中";
 }
 // 秒 → 人类可读的剩余时间
@@ -3375,18 +5908,35 @@ function fmtAgo(ts){
 /* 一个账号的卡片。
    布局：头部（序号+邮箱+来源+状态徽标）→ 数据格 → 最后错误行 → 动作排。 */
 function acctCard(a){
-  var st = !a.enabled ? "off" : (a.available ? "live" : "cool");
+  // 冷却改成「账号×模型」级后，「可用」只表示账号本身参与调度；
+  // 具体哪个模型受限看 cooldown_models。卡片状态因此分三档：
+  //   停用 / 全部模型都在冷却（真正不可用）/ 部分模型冷却（还能用别的模型）
+  var cms = a.cooldown_models || [];
+  var allCooling = false;
+  if(a.enabled && cms.length){
+    var known = state.owned.length;
+    // 模型总数未知时（health 降级视图）不轻易判定「全部冷却」
+    allCooling = known > 0 && cms.length >= known;
+  }
+  var st = !a.enabled ? "off" : (cms.length ? (allCooling ? "cool" : "warn") : "live");
   var badge = !a.enabled
     ? '<span class="badge off">已停用</span>'
-    : (a.available ? '<span class="badge live">可用</span>'
-                   : '<span class="badge cool">冷却中</span>');
+    : (cms.length
+        ? (allCooling ? '<span class="badge cool">冷却中</span>' : '<span class="badge part">部分冷却</span>')
+        : '<span class="badge live">可用</span>');
 
-  // 冷却：只在真的冷却时显示剩余时间；可用账号显示 token 缓存状态更有用
-  var coolV, coolCls;
-  if(!a.enabled){ coolV="—"; coolCls="dim"; }
-  else if(a.available){ coolV="无"; coolCls="dim"; }
-  else { coolV=fmtDur(a.cooldown_seconds); coolCls="warn"; }
-  var coolK = (!a.enabled||a.available) ? "冷却" : "冷却（"+coolLabel(a.cooldown_reason)+"）";
+  // 冷却列显示最长的那个剩余时间（多模型冷却时数字旁边标出数量）
+  var coolV, coolCls, coolK;
+  if(!a.enabled){ coolV="—"; coolCls="dim"; coolK="冷却"; }
+  else if(!cms.length){ coolV="无"; coolCls="dim"; coolK="冷却"; }
+  else {
+    coolV = fmtDur(a.cooldown_seconds)+(cms.length>1?" · "+cms.length+" 个模型":"");
+    coolCls="warn";
+    // 原因取最明确的那条：额度用尽比「未知」值得说
+    var lim = null;
+    for(var i=0;i<cms.length;i++){ if(cms[i].limited){ lim=cms[i]; break; } }
+    coolK = "冷却（"+coolLabel((lim||cms[0]).kind)+"）";
+  }
 
   var s = a.stats || {};
   // 成功率：只在有调用记录时显示，否则显示 "—"（避免 0% 的误导）
@@ -3413,7 +5963,7 @@ function acctCard(a){
       '<span class="ix">'+(a.index+1)+'</span>'+
       '<span class="who">'+
         '<span class="ml" title="'+esc(email)+'">'+esc(email)+'</span>'+
-        '<span class="src">'+(a.runtime?'<b>临时</b>· 登录得到':'环境变量')+'</span>'+
+        '<span class="src">'+(a.runtime?'<b>已存盘</b> · 控制台登录':'环境变量')+'</span>'+
       '</span>'+
       badge+
     '</div>'+
@@ -3429,10 +5979,12 @@ function acctCard(a){
     '</div>'+
     lastRow+
     '<div class="act">'+
+      '<button class="xs" data-detail="'+esc(a.id)+'" title="查看该账号的模型级冷却、可用模型与 token 用量">详情</button>'+
+      '<button class="xs" data-balance="'+esc(a.id)+'" title="查询该账号的官方 Credit 余额">余额</button>'+
       (a.enabled
         ? '<button class="xs" data-act="disable" data-id="'+esc(a.id)+'" title="停止参与轮询（可用时仍保留在池里）">停用</button>'
         : '<button class="xs" data-act="enable" data-id="'+esc(a.id)+'" title="重新参与轮询">启用</button>')+
-      '<button class="xs" data-act="reset" data-id="'+esc(a.id)+'" title="清除冷却与 token 缓存">重置冷却</button>'+
+      '<button class="xs" data-act="reset" data-id="'+esc(a.id)+'" title="清除该账号所有模型的冷却与 token 缓存">重置冷却</button>'+
       removeBtn+
     '</div>'+
   '</div>';
@@ -3441,19 +5993,26 @@ function acctCard(a){
 function renderAccts(){
   var det=(state.health&&state.health.account_details)||[];
   var g=$("accts");
-  var avail=det.filter(function(a){return a.available;}).length;
+  // 冷却改为「账号×模型」级后，计数口径要跟着改：
+  //   可用   = 启用且没有任何模型在冷却
+  //   冷却中 = 启用、但有模型在冷却（是否「全部」不影响计数，卡片上会区分）
+  var avail=det.filter(function(a){return a.enabled&&!(a.cooldown_models||[]).length;}).length;
   var off=det.filter(function(a){return !a.enabled;}).length;
-  var cool=det.filter(function(a){return a.enabled&&!a.available;}).length;
+  var cool=det.filter(function(a){return a.enabled&&(a.cooldown_models||[]).length>0;}).length;
 
   $("acOk").textContent=avail; $("acCool").textContent=cool;
   $("acOff").textContent=off;  $("acTotal").textContent=det.length;
 
   // 概览右侧一句话：把最该采取行动的情况说清楚
   var hint="";
-  if(det.length&&avail===0){
+  if(!state.hasDetail){
+    hint='<span style="color:var(--warn)">读不到账号明细：请在下方填入 API Key（「接入配置」页可复制）</span>';
+  } else if(det.length&&avail===0&&cool===0){
     hint = off===det.length
       ? '<span style="color:var(--bad)">全部账号已停用，请求会直接失败</span>'
       : '<span style="color:var(--warn)">当前没有可用账号，请求会返回 429</span>';
+  } else if(cool>0&&avail===0){
+    hint='<span style="color:var(--warn)">所有账号都有模型在冷却；额度按「账号×模型」独立计算，等恢复或加号</span>';
   } else if(off>0){
     hint='<span style="color:var(--ink-3)">'+off+' 个账号已停用，不参与轮询</span>';
   } else if(det.length){
@@ -3467,13 +6026,15 @@ function renderAccts(){
 }
 
 /* 账号控制：把动作发给服务端，用返回的最新账号列表直接刷新界面，
-   省掉一次 /v1/health 往返。 */
-function accountAction(action,id,btn){
+   省掉一次 /v1/health 往返。
+   modelId 只在 clearCooldown（解除单个「账号×模型」冷却）时使用。 */
+function accountAction(action,id,btn,modelId){
   var busyLabel = {disable:"停用中",enable:"启用中",reset:"重置中",remove:"移除中",
-                   enableAll:"启用中",resetAll:"重置中"}[action] || "处理中";
+                   enableAll:"启用中",resetAll:"重置中",clearCooldown:"解除中"}[action] || "处理中";
   if(btn){ btn.disabled=true; flash(btn,busyLabel); }
   var payload={action:action};
   if(id) payload.id=id;
+  if(modelId) payload.modelId=modelId;
 
   return fetch("/v1/accounts/action",{method:"POST",headers:authHeaders(),body:JSON.stringify(payload)})
     .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
@@ -3486,11 +6047,15 @@ function accountAction(action,id,btn){
         return;
       }
       // 用返回的账号列表就地更新，页面立刻反映新状态
-      if(state.health) state.health.account_details=o.d.accounts;
-      if(state.health) state.health.account_count=o.d.accounts.length;
+      if(state.health){
+        state.health.account_details=o.d.accounts;
+        state.health.account_count=o.d.accounts.length;
+      }
       recalcHealthCounts();
       renderAccts(); renderHealth(state.health);
       if(o.d.message) toast("ok","已完成", esc(o.d.message));
+      // 详情弹窗里点的「解除冷却」：列表已刷新，把弹窗内容也更新掉
+      if(action==="clearCooldown"&&$("acctModal")&&!$("acctModal").hidden) openAcctDetail(id);
     })
     .catch(function(e){ if(btn) btn.disabled=false; toastError("账号操作请求失败", e); });
 }
@@ -3500,8 +6065,134 @@ function recalcHealthCounts(){
   var h=state.health; if(!h||!h.account_details) return;
   h.account_count=h.account_details.length;
   h.accounts=h.account_count;
-  h.accounts_available=h.account_details.filter(function(a){return a.available;}).length;
+  h.accounts_available=h.account_details.filter(function(a){
+    return a.enabled&&!(a.cooldown_models||[]).length;
+  }).length;
   h.runtime_accounts=h.account_details.filter(function(a){return a.runtime;}).length;
+}
+
+/* ── 账号详情 / 余额 ──
+   详情回答的是「这个账号现在哪些模型到了上限、什么时候恢复、还有哪些模型能用」——
+   额度的粒度就是「账号×模型」，所以视图要对齐这个粒度，而不是只给一个总数。 */
+function openAcctDetail(id){
+  var box="acctModal";
+  var el=$(box);
+  if(!el){
+    var d=document.createElement("div");
+    d.className="modal-bg"; d.id=box;
+    d.innerHTML='<div class="modal"><header><h3 id="acctModalTtl">账号详情</h3>'+
+      '<span class="grow"></span><button class="xs ghost" id="acctModalClose">关闭</button></header>'+
+      '<div class="pad" id="acctModalBody"></div></div>';
+    document.body.appendChild(d);
+    $("acctModalClose").addEventListener("click",function(){ $("acctModal").hidden=true; });
+    d.addEventListener("click",function(e){ if(e.target===d) d.hidden=true; });
+  }
+  el.hidden=false;
+  $("acctModalBody").innerHTML='<div class="num" style="color:var(--ink-3)">读取中…</div>';
+  fetch("/v1/accounts/detail?id="+encodeURIComponent(id),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("acctModalBody").innerHTML='<div class="err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+'</div>';
+        return;
+      }
+      renderAcctDetail(o.d);
+    })
+    .catch(function(e){
+      $("acctModalBody").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+'</div>';
+    });
+}
+
+function renderAcctDetail(d){
+  $("acctModalTtl").textContent="账号详情 · "+(d.email||d.id.slice(0,6));
+  var lim=d.limited||[];
+  var limRows = lim.length
+    ? lim.map(function(c){
+        return '<tr><td class="mid">'+esc(c.model_id)+'</td>'+
+          '<td>'+esc(coolLabel(c.kind))+'</td>'+
+          '<td class="num">'+esc(fmtDur(c.remaining_seconds))+'</td>'+
+          '<td class="num">'+esc(c.resets_at?fmtClock(new Date(c.resets_at).getTime()):"—")+'</td>'+
+          '<td class="acts"><button class="xs" data-clear="'+esc(d.id)+'" data-model="'+esc(c.model_id)+'">解除冷却</button></td></tr>';
+      }).join("")
+    : '<tr><td colspan="5" class="dim" style="padding:11px">没有模型在冷却中。</td></tr>';
+
+  var others=(d.other_models||[]);
+  var otherHtml = others.length
+    ? others.slice(0,60).map(function(m){ return '<code class="chiplite">'+esc(m)+'</code>'; }).join(" ")
+      + (others.length>60?' <span class="dim">…共 '+others.length+' 个</span>':'')
+    : '<span class="dim">没有其它可用模型。</span>';
+
+  var ut=d.usage_total||{}, ud=d.usage_today||{};
+  $("acctModalBody").innerHTML=
+    '<div class="kv2">'+
+      '<div><span class="k">状态</span><span class="v">'+esc(d.enabled?"启用":"已停用")+'</span></div>'+
+      '<div><span class="k">来源</span><span class="v">'+esc(d.runtime?"控制台登录（已存盘）":"环境变量")+'</span></div>'+
+      '<div><span class="k">token 缓存</span><span class="v">'+esc(d.token_cached?"有":"无")+'</span></div>'+
+      '<div><span class="k">兜底冷却时长</span><span class="v">'+esc(d.cooldown_minutes+" 分钟")+'</span></div>'+
+    '</div>'+
+    '<h4 class="mh">冷却中的模型（额度按「账号×模型」独立计算）</h4>'+
+    '<div class="tblwrap tblfixed"><table class="m"><thead><tr><th>模型</th><th>原因</th><th>剩余</th><th>恢复时刻</th><th></th></tr></thead>'+
+    '<tbody>'+limRows+'</tbody></table></div>'+
+    '<h4 class="mh">现在可用的模型（'+others.length+'）</h4>'+
+    '<div class="chips">'+otherHtml+'</div>'+
+    '<h4 class="mh">Token 用量（累计 / 今日）</h4>'+
+    '<div class="kv2">'+
+      '<div><span class="k">输入</span><span class="v">'+esc(fmtTok(ut.input)+" / "+fmtTok(ud.input))+'</span></div>'+
+      '<div><span class="k">输出</span><span class="v">'+esc(fmtTok(ut.output)+" / "+fmtTok(ud.output))+'</span></div>'+
+      '<div><span class="k">合计</span><span class="v">'+esc(fmtTok(ut.total)+" / "+fmtTok(ud.total))+'</span></div>'+
+      '<div><span class="k">上游调用</span><span class="v">'+esc(String(ut.calls||0)+" / "+String(ud.calls||0))+'</span></div>'+
+    '</div>'+
+    '<h4 class="mh">refreshToken</h4>'+
+    '<p class="desc">'+
+      (d.rotated
+        ? "<b>该账号的 token 已被上游轮换过</b>（内存里是新值）。环境变量账号的新值无法自动写回，请复制下面这份更新配置；控制台登录的账号已自动落盘。"
+        : "默认只显示脱敏值。需要换机器部署或手工备份时点「显示」取完整值。")+'</p>'+
+    '<div class="snip" id="rtBox" style="margin:0 0 9px">'+esc(d.refresh_token||d.refresh_token_masked||"")+'</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+      '<button class="primary" id="btnRtReveal">显示完整值</button>'+
+      '<button class="ghost" id="btnRtCopy">复制</button>'+
+      '<button class="ghost" id="btnBal">查询官方余额</button>'+
+    '</div>'+
+    '<div id="balBox" style="margin-top:11px"></div>';
+
+  var rtFull=d.refresh_token||"";
+  $("btnRtReveal").addEventListener("click",function(){
+    fetch("/v1/accounts/detail?id="+encodeURIComponent(d.id)+"&reveal=1",{headers:authHeaders(),cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(o){
+        if(!o.ok){ toastError("读取完整 token 失败",o); return; }
+        rtFull=o.refresh_token||"";
+        $("rtBox").textContent=rtFull;
+        flash($("btnRtReveal"),"已显示");
+      })
+      .catch(function(e){ toastError("读取完整 token 失败",e); });
+  });
+  $("btnRtCopy").addEventListener("click",function(){ copyText(rtFull||$("rtBox").textContent,$("btnRtCopy"),$("rtBox")); });
+  $("btnBal").addEventListener("click",function(){ queryBalance(d.id,$("btnBal"),$("balBox")); });
+}
+
+function queryBalance(id,btn,box){
+  if(btn){ btn.disabled=true; flash(btn,"查询中"); }
+  fetch("/v1/accounts/balance?id="+encodeURIComponent(id),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn){ btn.disabled=false; btn.textContent="查询官方余额"; }
+      if(!o.d.ok){
+        box.innerHTML='<div class="err">'+esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+'</div>';
+        return;
+      }
+      box.innerHTML='<div class="kv2">'+
+        '<div><span class="k">Credit 余额</span><span class="v ok">'+esc(fmtNum(o.d.balance,6))+'</span></div>'+
+        '<div><span class="k">查询时刻</span><span class="v">'+esc(fmtClock(o.d.checkedAt))+'</span></div>'+
+      '</div>'+
+      '<p class="desc" style="font-size:10.5px;color:var(--ink-3);margin-top:7px">'+
+        '官方接口的原始值以微单位计，这里已按 ÷1e6 换算成面板上显示的 Credit。</p>';
+    })
+    .catch(function(e){
+      if(btn){ btn.disabled=false; btn.textContent="查询官方余额"; }
+      box.innerHTML='<div class="err">'+esc(String(e&&e.message||e))+'</div>';
+    });
 }
 
 /* ── 登录 ── */
@@ -3628,120 +6319,381 @@ function costPill(m){
   if(m.cost==="paid") return '<span class="tag paid">付费</span>';
   return '<span class="tag ov">未标价</span>';
 }
-function loadModels(){
-  var saved=load(LS.tests,{})||{};
-  return fetch("/v1/models",{cache:"no-store"})
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      state.models=(d.data||[]).map(function(m){
-        return { id:m.id, cost:m.cost, free:m.free, channel:m.channel, label:m.label, test:state.testingIds&&state.testingIds[m.id]||saved[m.id]||null };
-      });
-    })
-    .catch(function(){ state.models=[]; })
-    .then(function(){
-      $("cnt-model").textContent=state.models.length?String(state.models.length):"";
-      var sel=$("model");
-      if(!state.models.length){
-        sel.innerHTML='<option value="">模型列表拉取失败</option>';
-        $("mRows").innerHTML=""; $("mEmpty").hidden=false; $("mEmpty").textContent="模型列表拉取失败，点「重新拉取」重试。";
-        renderMStats(); return;
+/* ══ 模型库 ══
+   三段式：可用模型分组（推荐清单）/ 全部模型（折叠，按需抓）/ 已启用模型。
+   三处的卡片共用 modelCardHTML，保证格式与交互完全一致。
+
+   注意：本文件会被 build-console.mjs 注入 worker.js 的模板字符串，
+   反引号与 \${ 会被转义而失效 —— 只能用字符串拼接。 */
+
+// 已启用模型的 ID 集合（判断卡片是否已添加、决定 ＋ 是否可点）
+function ownedSet(){
+  var s={}; for(var i=0;i<state.owned.length;i++) s[state.owned[i].id]=true; return s;
+}
+
+// 模型卡片的「检测」状态：跑着的、跑完的，都从内存里取（服务端不存检测结果，
+// 因为它只回答"刚才那一刻能不能用"，存下来反而会被误当成长期结论）
+function checkState(id){
+  var c=state.mchecks[id];
+  if(!c) return { cls:"", text:"", btn:"检测" };
+  if(c.status==="running") return { cls:"", text:"检测中…", btn:"检测中" };
+  if(c.status==="failed") return { cls:"bad", text:c.error||"检测失败", btn:"重测" };
+  var r=c.result||{};
+  return { cls:r.ok?"ok":"bad", text:r.text||"", btn:"重测" };
+}
+
+// 一张模型卡片。installed=true 时高亮并显示 ✓。
+function modelCardHTML(m, installed){
+  var has=!!installed[m.id];
+  var ck=checkState(m.id);
+  var tags=(m.tags||[]).filter(function(t){return t;}).map(function(t){
+    return '<span class="mtag">'+esc(t)+"</span>";
+  }).join("");
+  var name=m.name||m.id;
+  var ctx=m.context_length?'<span class="mctx" title="上下文长度">'+fmtCtx(m.context_length)+"</span>":"";
+  // 标题提示：把 ID、描述、下一步动作都放进去，卡片本身不用铺满这些信息
+  var tip=[name,m.id,m.description,"",has?"已启用 · 点 ⧉ 复制 ID":"点 ＋ 添加"].filter(function(x){return x;}).join("\\n");
+  return '<div class="mcard'+(has?" on":"")+'" data-mid="'+esc(m.id)+'" data-on="'+(has?"1":"0")+'" title="'+esc(tip)+'">'+
+    '<div class="mrow">'+
+      '<span class="mname">'+esc(name)+"</span>"+
+      (m.id&&m.id!==name?'<span class="mid">'+esc(m.id)+"</span>":"")+
+      ctx+tags+
+    "</div>"+
+    // 按钮单独一行（见 CSS 里关于折行的说明）
+    '<div class="macts">'+
+      '<button class="xs ghost" data-check="'+esc(m.id)+'"'+(ck.btn==="检测中"?" disabled":"")+">"+esc(ck.btn)+"</button>"+
+      '<button class="xs primary" data-add="'+esc(m.id)+'" title="添加此模型"'+(has?" disabled":"")+">＋ 添加</button>"+
+      '<button class="xs ghost" data-copyid="'+esc(m.id)+'" title="复制模型 ID">⧉ 复制</button>'+
+    "</div>"+
+    (ck.text?'<div class="mchk '+ck.cls+'">'+esc(ck.text)+"</div>":"")+
+    (m.description?'<div class="mdesc">'+esc(m.description)+"</div>":"")+
+  "</div>";
+}
+
+// 一组模型（分组标题 + 整组添加 + 卡片墙）
+function modelGroupHTML(g, installed){
+  var models=g.models||[];
+  var meta=g.meta||{};
+  var pending=models.filter(function(m){return !installed[m.id];}).length;
+  var addAll = pending
+    ? '<button class="xs primary" data-addgroup="'+esc(g.key)+'">全部添加 ('+pending+")</button>"
+    : '<button class="xs ghost" disabled>已全部添加</button>';
+  return '<div class="mgroup" data-gkey="'+esc(g.key)+'">'+
+    '<div class="mghead">'+
+      '<span class="gdot" style="background:'+(meta.color||"var(--ink-3)")+'"></span>'+
+      "<h4>"+esc(meta.title||g.key)+"</h4>"+
+      (meta.sub?'<span class="gsub">（'+esc(meta.sub)+"）</span>":"")+
+      '<span class="note">共 '+models.length+" 个"+(pending?" · 待添加 "+pending:" · 已全部添加")+"</span>"+
+      '<span class="grow"></span>'+
+      addAll+
+    "</div>"+
+    '<div class="mcards">'+models.map(function(m){ return modelCardHTML(m,installed); }).join("")+"</div>"+
+  "</div>";
+}
+
+// 上下文长度按 K 显示：500000 → 500K（比 500,000 好读，也和模型页的惯例一致）
+function fmtCtx(n){
+  n=Number(n)||0;
+  if(!n) return "";
+  if(n>=1000000) return (n/1000000).toFixed(n%1000000?1:0)+"M";
+  if(n>=1000) return Math.round(n/1000)+"K";
+  return String(n);
+}
+
+// 拉推荐分组（面板打开时调；force 用于「刷新数据」）
+function loadModelLibrary(force){
+  var btn=$("mRefreshBtn");
+  if(force&&btn){ btn.disabled=true; flash(btn,"刷新中"); }
+  $("mLibrary").innerHTML='<div class="empty">'+(force?"正在重新抓取上游…":"加载中…")+"</div>";
+  return fetch("/v1/models/library"+(force?"?refresh=1":""),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){
+        $("mLibrary").innerHTML='<div class="err"><b>加载失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+
+          '<br>请先在「接入配置」页填入 API Key。</div>';
+        $("mLibNote").textContent="";
+        return;
       }
-      var ids=state.models.map(function(m){return m.id;});
-      sel.innerHTML=ids.map(function(id){ return '<option value="'+esc(id)+'"'+(id===state.model?" selected":"")+">"+esc(id)+"</option>"; }).join("");
-      if(ids.indexOf(state.model)<0){ state.model=ids[0]; sel.value=state.model; save(LS.model,state.model); }
-      renderMRows(); renderMStats();
+      state.mLibGroups=o.d.groups||[];
+      renderModelLibrary();
+      // 折叠区的「已添加」标记也依赖已启用列表，一并刷新免得两处互相矛盾
+      if(state.mCatLoaded) renderModelCatalog();
+      if(o.d.stale&&o.d.error){
+        toast("warn","上游抓取失败，显示上次缓存", esc(o.d.error));
+      } else if(force){
+        toast("ok","模型数据已刷新","");
+      }
+    })
+    .catch(function(e){
+      if(btn) btn.disabled=false;
+      $("mLibrary").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
     });
 }
-function visibleModels(){
-  var q=$("mfilter").value.trim().toLowerCase();
-  var freeOnly=$("mfree").checked, cnOnly=$("mcn").checked;
-  var list=state.models.filter(function(m){
-    if(freeOnly&&!isFree(m)) return false;
-    if(cnOnly&&regionOf(m.id)!=="cn") return false;
-    if(q&&m.id.toLowerCase().indexOf(q)<0&&regionName(m.id).toLowerCase().indexOf(q)<0) return false;
-    return true;
-  });
-  var s=state.sort, dir=state.sortDir;
-  list.sort(function(a,b){
-    var r;
-    // 地区排序：国产始终优先（无论升降序都先给国产，第二段才按 id）
-    if(s==="region"){
-      var ra=regionOf(a.id)==="cn"?0:1, rb=regionOf(b.id)==="cn"?0:1;
-      if(ra!==rb) return ra-rb;
-      r = a.id<b.id?-1:a.id>b.id?1:0;
-      return r*dir;
-    }
-    if(s==="speed"){
-      var av=typeof a.test?.tps==="number"?a.test.tps:-1, bv=typeof b.test?.tps==="number"?b.test.tps:-1;
-      if(av!==bv) return (av-bv)*dir;
-    } else if(s==="ttft"){
-      var at=a.test&&a.test.ttft!=null?a.test.ttft:Infinity, bt=b.test&&b.test.ttft!=null?b.test.ttft:Infinity;
-      if(at!==bt) return (at-bt)*dir;
-    }
-    r = a.id<b.id?-1:a.id>b.id?1:0;
-    return r*dir;
-  });
-  return list;
+
+function renderModelLibrary(){
+  var groups=state.mLibGroups||[];
+  var inst=ownedSet();
+  if(!groups.length){
+    $("mLibrary").innerHTML='<div class="empty">暂无数据，点右上角「刷新数据」。</div>';
+    $("mLibNote").textContent="";
+    return;
+  }
+  $("mLibrary").innerHTML=groups.map(function(g){ return modelGroupHTML(g,inst); }).join("");
+  var total=groups.reduce(function(n,g){ return n+(g.models||[]).length; },0);
+  $("mLibNote").textContent="共 "+total+" 个 · 已启用 "+state.owned.length+" 个";
 }
-function renderMRows(){
-  var list=visibleModels(), maxTps=0;
-  for(var k=0;k<state.models.length;k++){ var t=state.models[k].test; if(t&&t.tps>maxTps) maxTps=t.tps; }
-  $("mRows").innerHTML=list.map(function(m){
-    var t=m.test, spd, ttft, isCn=regionOf(m.id)==="cn";
-    if(!t){
-      spd='<div class="spd"><span class="n na">未测试</span><span class="h na" style="width:0"></span></div>';
-      ttft='<span class="num" style="color:var(--ink-3)">-</span>';
-    } else if(t.ok){
-      var pct=maxTps>0&&t.tps?Math.max(3,Math.round(t.tps/maxTps*100)):0;
-      spd='<div class="spd"><span class="n">'+fmtNum(t.tps,1)+' tok/s</span><span class="h" style="width:'+pct+'%"></span></div>';
-      ttft='<span class="num">'+fmtMs(t.ttft)+"</span>";
-    } else {
-      spd='<div class="spd"><span class="n" style="color:var(--bad)">失败</span><span class="h" style="width:0;background:var(--bad)"></span></div>';
-      ttft='<span class="num" style="color:var(--ink-3)">-</span>';
-    }
-    var btn='<button class="xs ghost" data-test="'+esc(m.id)+'">'+(t&&t.busy?"测试中":t?"重测":"测试")+"</button>";
-    var title="";
-    if(t&&t.at){ var mi=Math.round((Date.now()-t.at)/60000); title=' title="上次测量：'+(mi<1?"刚刚":mi+" 分钟前")+'"'; }
-    var regTag = isCn ? '<span class="tag cn">'+esc(regionName(m.id))+"</span>"
-                      : (regionOf(m.id)==="of" ? '<span class="tag free">官方</span>' : '<span class="tag ov">'+esc(regionName(m.id))+"</span>");
-    return '<tr class="'+(isCn?"cn":"")+'">'+
-      "<td>"+regTag+"</td>"+
-      '<td class="mid">'+esc(m.id)+"</td>"+
-      "<td>"+costPill(m)+"</td>"+
-      "<td"+title+">"+spd+"</td>"+
-      "<td>"+ttft+"</td>"+
-      '<td class="acts">'+btn+" "+
-        '<button class="xs ghost" data-copyid="'+esc(m.id)+'">复制 ID</button> '+
-        '<button class="xs ghost" data-use="'+esc(m.id)+'">用于对话</button></td></tr>';
+
+// 全部模型：只在用户展开时抓一次（上游 440+ 条、约 500 KB）
+function loadModelCatalog(force){
+  state.mCatLoaded=true;
+  $("mCatalog").innerHTML='<div class="empty">正在抓取全部模型…（上游约 500 KB，首次会慢几秒）</div>';
+  return fetch("/v1/models/catalog"+(force?"?refresh=1":""),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("mCatalog").innerHTML='<div class="err"><b>加载失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+"</div>";
+        return;
+      }
+      state.mCatalog=o.d.groups||[];
+      state.mCatalogTotal=o.d.total||0;
+      renderModelCatalog();
+    })
+    .catch(function(e){
+      $("mCatalog").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
+    });
+}
+
+// 搜索只过滤本地已有数据，不发请求（只过一遍 400+ 条，没必要加防抖）
+function filterCatalog(groups,q){
+  q=String(q||"").trim().toLowerCase();
+  if(!q) return groups;
+  var out=[];
+  for(var i=0;i<groups.length;i++){
+    var hit=groups[i].models.filter(function(m){
+      return String(m.name||"").toLowerCase().indexOf(q)>=0||String(m.id||"").toLowerCase().indexOf(q)>=0;
+    });
+    if(hit.length) out.push({key:groups[i].key,models:hit});
+  }
+  return out;
+}
+
+function renderModelCatalog(){
+  var groups=state.mCatalog||[];
+  if(!groups.length){ $("mCatalog").innerHTML='<div class="empty">暂无数据</div>'; return; }
+  var q=$("mCatSearch").value;
+  // 搜索时重新按供应商分组：过滤后空掉的组不该留一个空壳标题
+  var shown=q?filterCatalog(groups,q):groups;
+  var inst=ownedSet();
+  var matched=shown.reduce(function(n,g){ return n+(g.models||[]).length; },0);
+  $("mCatCount").textContent=q
+    ? ("匹配 "+matched+" 个 / 共 "+state.mCatalogTotal+" 个")
+    : (state.mCatalogTotal+" 个模型 · "+groups.length+" 个供应商");
+  if(!shown.length){
+    $("mCatalog").innerHTML='<div class="empty">没有匹配「'+esc(q)+'」的模型。</div>';
+    return;
+  }
+  $("mCatalog").innerHTML=shown.map(function(g){ return modelGroupHTML(g,inst); }).join("");
+}
+
+// 已启用模型：这是 /v1/models 真正会返回的内容
+function loadOwnedModels(){
+  return fetch("/v1/models/enabled",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("mOwned").innerHTML='<div class="err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+"</div>";
+        return;
+      }
+      state.owned=o.d.models||[];
+      state.ownedBuiltin=!!o.d.using_builtin;
+      renderOwnedModels();
+    })
+    .catch(function(e){
+      $("mOwned").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
+    });
+}
+
+function renderOwnedModels(){
+  var list=state.owned||[];
+  var cnt=$("cnt-model"); if(cnt) cnt.textContent=list.length?String(list.length):"";
+  $("mOwnNote").textContent=list.length?("共 "+list.length+" 个"):"";
+
+  // 一个都没启用时服务端回退到内置推荐 —— 必须明确说出来，否则用户会以为
+  // 列表里的四个模型是他自己加过的
+  var hint=$("mOwnHint");
+  if(state.ownedBuiltin){
+    hint.innerHTML='<b>还没有手动启用过模型</b>，所以 <code>/v1/models</code> 暂时回退到'
+      +'内置推荐（下面这几个）。从上面任一分组里添加模型后，就以你的选择为准。';
+  } else {
+    hint.innerHTML='只有这里的模型会出现在 <code>/v1/models</code> 里。点「移除」即可撤下。';
+  }
+
+  if(!list.length){ $("mOwned").innerHTML='<div class="empty">还没有模型。</div>'; return; }
+  $("mOwned").innerHTML='<div class="mcards">'+list.map(function(m){
+    var badge=m.is_default?'<span class="badge live">默认</span>':"";
+    var ck=checkState(m.id);
+    return '<div class="mcard on'+(m.is_default?" def":"")+'" data-mid="'+esc(m.id)+'">'+
+      '<div class="mrow">'+
+        '<span class="mname">'+esc(m.name||m.id)+"</span>"+
+        (m.name&&m.name!==m.id?'<span class="mid">'+esc(m.id)+"</span>":"")+
+        (m.context_length?'<span class="mctx">'+fmtCtx(m.context_length)+"</span>":"")+
+        badge+
+      "</div>"+
+      '<div class="macts">'+
+        // 检测按钮在已启用卡片上同样需要：加之前能用不代表现在还能用，
+        // 而"这个模型到底还行不行"正是这一页最常见的诉求
+        '<button class="xs ghost" data-check="'+esc(m.id)+'"'+(ck.btn==="检测中"?" disabled":"")+">"+esc(ck.btn)+"</button>"+
+        (m.is_default?"":'<button class="xs ghost" data-setdefault="'+esc(m.id)+'" title="不带 model 的请求默认用它">设为默认</button>')+
+        '<button class="xs ghost" data-copyid="'+esc(m.id)+'" title="复制模型 ID">⧉ 复制</button>'+
+        '<button class="xs danger" data-rm="'+esc(m.id)+'" title="从 /v1/models 里撤下">移除</button>'+
+      "</div>"+
+      (ck.text?'<div class="mchk '+ck.cls+'">'+esc(ck.text)+"</div>":"")+
+      (m.description?'<div class="mdesc">'+esc(m.description)+"</div>":"")+
+    "</div>";
   }).join("");
-  var emp=$("mEmpty");
-  if(!list.length){ emp.hidden=false; emp.textContent=state.models.length?"没有符合筛选条件的模型。":"模型列表为空。"; }
-  else emp.hidden=true;
-  // 列表本身已按免费白名单筛过，所以默认「只看免费」几乎不减少条数；
-  // 这里仍区分总数与显示数，是为了让「只看国产」与搜索的筛选结果一目了然
-  var cnAll=state.models.filter(function(m){return regionOf(m.id)==="cn";}).length;
-  $("mNote").textContent="可用免费模型 "+state.models.length+" 个（国产 "+cnAll+"）· 当前显示 "+list.length+" 个";
 }
-function renderMStats(){
-  var tot=state.models.length;
-  var free=state.models.filter(isFree).length;
-  var cn=state.models.filter(function(m){return regionOf(m.id)==="cn";}).length;
-  var tested=state.models.filter(function(m){return m.test&&m.test.ok;});
-  var tpss=tested.map(function(m){return m.test.tps;}).filter(function(v){return typeof v==="number"&&isFinite(v)&&v>0;});
-  var ttfts=tested.map(function(m){return m.test.ttft;}).filter(function(v){return typeof v==="number"&&isFinite(v);});
-  var avg=function(a){ return a.length? a.reduce(function(x,y){return x+y;},0)/a.length : null; };
-  // 服务端已按免费白名单筛过，所以"总数"就等于可用免费模型数。
-  // 上游拉取失败会回退到内置列表（含 cline-pass 等非免费项），届时两者不等，
-  // 这种情况额外标出非免费条数，免得让人以为列表里全是免费可用的。
-  var paid=tot-free;
-  $("mStats").innerHTML=[
-    cell("可用免费模型",String(free),"ok"),
-    cell("国产模型",String(cn),"cn"),
-    cell("已测通",tested.length+" / "+tot),
-    cell("平均速度",avg(tpss)!==null?fmtNum(avg(tpss),1)+" tok/s":"-",avg(tpss)!==null?"ok":""),
-    cell("最快首字节",ttfts.length?fmtMs(Math.min.apply(null,ttfts)):"-")
-  ].concat(paid>0?[cell("非免费（回退列表）",String(paid),"")]:[]).join("");
+
+// 添加模型：单卡 ＋ 与整组「全部添加」走同一个接口，服务端把重复项计入 skipped
+function addModelIds(ids, okMsg){
+  if(!ids||!ids.length) return;
+  return fetch("/v1/models/batch",{method:"POST",headers:authHeaders(),body:JSON.stringify({ids:ids})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){ toastError("添加失败",o.d,"HTTP "+o.r.status); return; }
+      var added=o.d.added||[], skipped=o.d.skipped||[], failed=o.d.failed||{};
+      state.owned=o.d.models||[];
+      renderOwnedModels(); renderModelLibrary();
+      if(state.mCatLoaded) renderModelCatalog();
+      var failN=Object.keys(failed).length;
+      if(failN&&!added.length){
+        toast("err","添加失败", esc(Object.values(failed)[0]));
+      } else if(!added.length){
+        toast("warn","这些模型都已添加","未重复添加");
+      } else {
+        var parts=["新增 "+added.length+" 个"];
+        if(skipped.length) parts.push("已存在 "+skipped.length+" 个");
+        if(failN) parts.push("失败 "+failN+" 个");
+        toast("ok", okMsg||"已添加", esc(parts.join("，")));
+      }
+    })
+    .catch(function(e){ toastError("添加请求失败",e); });
 }
+
+function removeModel(id,btn){
+  if(btn){ btn.disabled=true; flash(btn,"移除中"); }
+  fetch("/v1/models/delete",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("移除失败",o.d,"HTTP "+o.r.status); return; }
+      state.owned=o.d.models||[];
+      renderOwnedModels(); renderModelLibrary();
+      if(state.mCatLoaded) renderModelCatalog();
+      toast("ok","已移除", esc(o.d.message||id));
+      loadModels();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("移除请求失败",e); });
+}
+
+function setDefaultModel(id,btn){
+  if(btn){ btn.disabled=true; flash(btn,"设置中"); }
+  fetch("/v1/models/default",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("设置失败",o.d,"HTTP "+o.r.status); return; }
+      state.owned=o.d.models||[];
+      renderOwnedModels();
+      toast("ok","已设为默认", esc(o.d.message||id));
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("设置请求失败",e); });
+}
+
+/* 模型检测：跑起来的检测在服务端有并发上限，所以这里让「同一时刻只跑一个」——
+   面板上连点一排「检测」不该把上游打出一串并发请求（免费通道并发会返回空响应）。 */
+function checkModel(id,btn){
+  if(btn) btn.disabled=true;
+  state.mchecks[id]={status:"running"};
+  refreshCheckUI(id);
+  fetch("/v1/models/check",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        state.mchecks[id]={status:"failed",error:(o.d.error&&o.d.error.message)||("HTTP "+o.r.status)};
+        refreshCheckUI(id); return;
+      }
+      pollCheck(id,o.d.job.id,0);
+    })
+    .catch(function(e){
+      state.mchecks[id]={status:"failed",error:String(e&&e.message||e)};
+      refreshCheckUI(id);
+    });
+}
+
+function pollCheck(id,jobId,tries){
+  if(tries>60){
+    state.mchecks[id]={status:"failed",error:"检测超时（仍在后台进行）"};
+    refreshCheckUI(id); return;
+  }
+  fetch("/v1/models/check?jobId="+encodeURIComponent(jobId),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){ state.mchecks[id]={status:"failed",error:(d.error&&d.error.message)||"状态不可读"}; refreshCheckUI(id); return; }
+      var j=d.job;
+      if(j.status==="running"){ setTimeout(function(){ pollCheck(id,jobId,tries+1); },1200); return; }
+      if(j.status==="failed"){ state.mchecks[id]={status:"failed",error:j.error||"检测失败"}; refreshCheckUI(id); return; }
+      state.mchecks[id]={status:"done",result:j.result};
+      refreshCheckUI(id);
+    })
+    .catch(function(){ setTimeout(function(){ pollCheck(id,jobId,tries+1); },1500); });
+}
+
+// 只重绘那张卡片的检测状态，不整页重渲染（否则输入框里的搜索词会被清掉）
+function refreshCheckUI(id){
+  var cards=document.querySelectorAll('.mcard[data-mid="'+id.replace(/"/g,'\\\\"')+'"]');
+  for(var i=0;i<cards.length;i++){
+    var ck=checkState(id);
+    var old=cards[i].querySelector(".mchk");
+    if(ck.text){
+      if(old){ old.className="mchk "+ck.cls; old.textContent=ck.text; }
+      else{
+        var d=document.createElement("div");
+        d.className="mchk "+ck.cls; d.textContent=ck.text;
+        // 插到整个动作行的后面（动作行现在是第二行，结果行跟在它下面）
+        var acts=cards[i].querySelector(".macts");
+        var anchor=acts||cards[i].querySelector(".mrow");
+        if(anchor&&anchor.nextSibling) cards[i].insertBefore(d,anchor.nextSibling);
+        else cards[i].appendChild(d);
+      }
+    } else if(old){ old.parentNode.removeChild(old); }
+    var b=cards[i].querySelector("button[data-check]");
+    if(b){ b.disabled=(ck.btn==="检测中"); b.textContent=ck.btn; }
+  }
+}
+
+// 表格视图（对话页的模型下拉、以及接入配置页要用）——只关心已启用模型，
+// 因为客户端能用的就是这些。
+function loadModels(){
+  return loadOwnedModels().then(function(){
+    var ids=(state.owned||[]).map(function(m){ return m.id; });
+    var sel=$("model");
+    if(!ids.length){
+      sel.innerHTML='<option value="">还没有启用模型</option>';
+      return;
+    }
+    sel.innerHTML=ids.map(function(id){
+      var mm=state.owned.filter(function(x){return x.id===id;})[0]||{};
+      var label=(mm.name&&mm.name!==id)?(mm.name+" · "+id):id;
+      return '<option value="'+esc(id)+'"'+(id===state.model?" selected":"")+">"+esc(label)+"</option>";
+    }).join("");
+    if(ids.indexOf(state.model)<0){ state.model=ids[0]; sel.value=state.model; save(LS.model,state.model); }
+  });
+}
+
 function cell(k,v,cls){ return '<div><div class="k">'+esc(k)+'</div><div class="v '+(cls||"")+'">'+esc(v)+"</div></div>"; }
 
 /* ══ Token 统计 ══
@@ -3762,6 +6714,319 @@ function fmtTok(n){
 // 只显示首/中/末三个横轴标签：30 个日期全放会糊成一团，还不如给最小的定位锚点
 function trendLabelHide(i,total){
   return !(i===0||i===total-1||i===Math.floor(total/2));
+}
+
+/* ══ 上游渠道 ══
+   面板只管「用户想钉什么」；管道归属与可用渠道清单是探测出来的，只读展示。
+   用户填的表单不提交探测字段，服务端会保留缓存（否则每次保存都得重探）。 */
+function loadUpstreams(){
+  $("upList").innerHTML='<div class="box"><div class="pad num" style="color:var(--ink-3)">读取中…</div></div>';
+  return fetch("/v1/upstreams?action=list",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("upList").innerHTML='<div class="box"><div class="pad err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+
+          '<br>请先在「接入配置」页填入 API Key。</div></div>';
+        return;
+      }
+      state.upstreams=o.d.upstreams||[];
+      state.upModels=o.d.models||[];
+      $("upNote").textContent=state.upstreams.length+" 个模型已配置";
+      var cnt=$("cnt-up"); if(cnt) cnt.textContent=state.upstreams.length||"";
+      $("upModelList").innerHTML=state.upModels.map(function(m){ return '<option value="'+esc(m)+'">'; }).join("");
+      if(!state.upstreams.length){
+        $("upList").innerHTML='<div class="box"><div class="pad"><div class="empty">'+
+          '还没有任何渠道配置。<br>全部模型都在自动模式下运行（由网关自己挑渠道，通常就是最优解）。</div></div></div>';
+        return;
+      }
+      $("upList").innerHTML=state.upstreams.map(upCard).join("");
+    })
+    .catch(function(e){
+      $("upList").innerHTML='<div class="box"><div class="pad err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+'</div></div>';
+    });
+}
+
+function upCard(cfg){
+  var m=cfg.model_id;
+  var pipe = cfg.pipeline
+    ? '<span class="badge live">'+esc(cfg.pipeline)+'</span>'
+    : '<span class="badge part">未探测</span>';
+  // 钉住生效确认：探测过、有钉住列表、且知道实际命中时才有意义
+  var match="";
+  if(cfg.pipeline&&(cfg.upstreams||[]).length&&cfg.lastProvider){
+    var hit=(cfg.upstreams||[]).some(function(u){ return normSlug(u)===normSlug(cfg.lastProvider); });
+    match=hit?'<span class="ok">✓ 钉住生效</span>':'<span class="bad">✗ 钉住未生效</span>';
+  }
+  var avail=(cfg.available||[]);
+  var probeHtml=
+    '<div class="probe">'+
+      '<div class="row"><span class="k">管道</span>'+(cfg.pipeline?esc(cfg.pipeline):'<span class="warn">未知（未探测）</span>')+
+        '<span class="k" style="margin-left:11px">实际命中</span>'+esc(cfg.lastProvider||"—")+
+        (match?' <span style="margin-left:9px">'+match+'</span>':'')+'</div>'+
+      '<div class="row" style="margin-top:5px"><span class="k">可用渠道（'+avail.length+'）</span></div>'+
+      '<div class="chips" style="margin-top:4px">'+
+        (avail.length?avail.map(function(u){return '<code class="chiplite">'+esc(u)+'</code>';}).join("")
+                     :'<span style="color:var(--ink-3)">未探到清单；可先点「探测」</span>')+
+      '</div>'+
+      (cfg.probedAt?'<div class="row" style="margin-top:5px"><span class="k">探测于</span>'+esc(fmtAgo(cfg.probedAt))+'</div>':'')+
+      '<div class="note" id="probeNote-'+esc(m)+'" hidden></div>'+
+    '</div>';
+
+  function chk(v,val){ return v===val?" selected":""; }
+  function chkB(v,val){ return v===val?" selected":""; }
+
+  return '<div class="box upcard" data-model="'+esc(m)+'">'+
+    '<header>'+
+      '<h3 style="font-size:11.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis">'+esc(m)+'</h3>'+
+      pipe+
+      '<span class="grow"></span>'+
+      '<button class="xs" data-upprobe="'+esc(m)+'">探测</button>'+
+      '<button class="xs ghost" data-updel="'+esc(m)+'">删除配置</button>'+
+    '</header>'+
+    '<div class="upbody">'+
+      '<div class="full">'+probeHtml+'</div>'+
+      '<div>'+
+        '<label class="lb">钉住的渠道（逗号分隔，顺序即优先级）</label>'+
+        '<input data-up="upstreams" value="'+esc((cfg.upstreams||[]).join(", "))+'" placeholder="留空 = 不钉，例如 alibaba, deepinfra">'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">排除的渠道（逗号分隔）</label>'+
+        '<input data-up="exclude" value="'+esc((cfg.exclude||[]).join(", "))+'" placeholder="例如 baseten, novita">'+
+        '<p class="desc" style="margin-top:4px">网关不认排除字段，所以会换算成白名单（依赖上面的可用渠道清单）。</p>'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">钉住模式</label>'+
+        '<select data-up="pinMode">'+
+          '<option value="strict"'+chk(cfg.pinMode,"strict")+'>strict — 只用这些渠道，不回退</option>'+
+          '<option value="preferred"'+chk(cfg.pinMode,"preferred")+'>preferred — 优先这些，允许回退</option>'+
+        '</select>'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">模型 ID 重定向（发给上游的真实 ID）</label>'+
+        '<input data-up="redirect" value="'+esc(cfg.redirect||"")+'" placeholder="留空 = 原样透传">'+
+      '</div>'+
+      '<div class="full">'+
+        '<label class="lb">别名（逗号分隔，同样适用本配置的其它模型 ID）</label>'+
+        '<input data-up="aliases" value="'+esc((cfg.aliases||[]).join(", "))+'" placeholder="例如 my-glm, team/glm">'+
+      '</div>'+
+      '<div class="full" style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">'+
+        '<button class="primary" data-upsave="'+esc(m)+'">保存</button>'+
+        '<span class="upmeta">管道：<code>'+(cfg.pipeline||"未知")+'</code>　'+
+        '探测结果会随保存一起保留，不必重探。</span>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+}
+
+// 渠道名归一化：direct 管道回的 provider 是显示名（"DeepInfra"），
+// 而清单里是 slug（"deepinfra"），比对前必须归一化，否则会误判「未生效」。
+function normSlug(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9]/g,""); }
+
+// 逗号分隔输入 → 数组（去空白与空项）
+function splitList(v){
+  return String(v||"").split(",").map(function(s){return s.trim();}).filter(function(s){return s;});
+}
+
+function upSave(modelId,btn){
+  var card=document.querySelector('.upcard[data-model="'+modelId+'"]');
+  if(!card){ return; }
+  var get=function(f){ var el=card.querySelector('[data-up="'+f+'"]'); return el?el.value:""; };
+  var cfg={
+    upstreams:splitList(get("upstreams")),
+    exclude:splitList(get("exclude")),
+    pinMode:get("pinMode"),
+    redirect:get("redirect").trim(),
+    aliases:splitList(get("aliases"))
+  };
+  if(btn){ btn.disabled=true; flash(btn,"保存中"); }
+  fetch("/v1/upstreams?action=save",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId,config:cfg})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("保存失败",o.d,"HTTP "+o.r.status); return; }
+      toast("ok","已保存", esc(o.d.message||""));
+      loadUpstreams();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("保存请求失败",e); });
+}
+
+/* 探测是异步的：服务端立刻返回 jobId，这里轮询状态。
+   探测要打两次上游，同步等会让页面转圈到超时。 */
+function upProbe(modelId,btn){
+  if(btn){ btn.disabled=true; flash(btn,"探测中"); }
+  var note=document.getElementById("probeNote-"+modelId);
+  var showNote=function(html){
+    if(!note) return;
+    note.hidden=false; note.innerHTML=html;
+  };
+  showNote('<span class="warn">正在探测：先发一次真实请求判定管道，再枚举可用渠道…</span>');
+
+  fetch("/v1/upstreams?action=probe",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){
+        showNote('<span class="bad">探测启动失败：</span>'+esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status)));
+        toastError("探测启动失败",o.d,"HTTP "+o.r.status);
+        return;
+      }
+      if(o.d.shared) showNote('<span class="warn">该模型已有一个探测在进行，共享其结果…</span>');
+      pollProbe(o.d.job.id,modelId,note,0);
+    })
+    .catch(function(e){
+      if(btn) btn.disabled=false;
+      showNote('<span class="bad">请求异常：</span>'+esc(String(e&&e.message||e)));
+    });
+}
+
+function pollProbe(jobId,modelId,note,tries){
+  // 最多等 ~2 分钟（探测自身超时是 5 分钟，但页面不该无限转）
+  if(tries>80){
+    if(note){ note.hidden=false; note.innerHTML='<span class="warn">探测仍在后台进行，稍后点「刷新」查看结果。</span>'; }
+    return;
+  }
+  fetch("/v1/upstreams?action=probe_status&jobId="+encodeURIComponent(jobId),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){
+        if(note){ note.hidden=false; note.innerHTML='<span class="warn">'+esc((d.error&&d.error.message)||"探测状态不可读")+'</span>'; }
+        return;
+      }
+      var j=d.job;
+      if(j.status==="running"){ setTimeout(function(){ pollProbe(jobId,modelId,note,tries+1); },1500); return; }
+      if(j.status==="failed"){
+        if(note){ note.hidden=false; note.innerHTML='<span class="bad">探测失败：</span>'+esc(j.error||"未知原因"); }
+        return;
+      }
+      var r2=j.result||{};
+      var hasPin=(r2.modelId?true:false);
+      var hit=r2.providerMatch?'<span class="ok">✓ 钉住生效</span>':'<span class="warn">（未配钉住，或钉住未生效）</span>';
+      if(note){
+        note.hidden=false;
+        note.innerHTML=
+          '<span class="k">管道</span> '+esc(r2.pipeline||"未知")+
+          '　<span class="k">实际命中</span> '+esc(r2.provider||"—")+
+          '　'+hit+
+          '　<span class="k">耗时</span> '+esc(fmtMs(r2.latencyMs))+
+          '<br><span class="k">可用渠道（'+((r2.available||[]).length)+'）</span> '+
+          ((r2.available||[]).length?esc(r2.available.join(", ")):'<span class="warn">未能枚举</span>')+
+          (r2.note?'<br><span class="k">说明</span> '+esc(r2.note):'');
+      }
+      toast("ok","探测完成","管道 "+esc(r2.pipeline||"未知")+"，可用渠道 "+((r2.available||[]).length)+" 个");
+      // 重新拉一次：管道归属与可用清单已写回配置，卡片上的白名单要跟着更新
+      loadUpstreams();
+    })
+    .catch(function(){
+      setTimeout(function(){ pollProbe(jobId,modelId,note,tries+1); },2000);
+    });
+}
+
+function upDelete(modelId,btn){
+  if(!confirm("删除这个模型的渠道配置？\\n\\n删除后该模型回到自动模式（由网关自己挑渠道）。冷却记录不受影响。")) return;
+  if(btn){ btn.disabled=true; flash(btn,"删除中"); }
+  fetch("/v1/upstreams?action=delete",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("删除失败",o.d,"HTTP "+o.r.status); return; }
+      toast("ok","已删除", esc(o.d.message||"")); loadUpstreams();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("删除请求失败",e); });
+}
+
+/* ══ 设置 ══ */
+function loadSettings(){
+  return fetch("/v1/config",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("setNote").innerHTML='<span style="color:var(--bad)">读取失败：请先在「接入配置」页填入 API Key</span>';
+        return;
+      }
+      renderSettings(o.d);
+    })
+    .catch(function(e){
+      $("setNote").innerHTML='<span style="color:var(--bad)">请求异常：'+esc(String(e&&e.message||e))+'</span>';
+    });
+}
+
+function renderSettings(c){
+  state.config=c;
+  $("setStrategy").value=c.strategy||"round_robin";
+  $("setCooldown").value=c.cooldown_minutes||30;
+  $("setOverride").value=c.override_prompt||"";
+
+  // 默认模型下拉：选项来自**已启用模型**（服务端 default_model_options）。
+  // 不再从 state.models 取——那曾经是"全部免费模型"，现在是已启用列表，
+  // 而默认模型只能从已启用里挑（服务端也这么校验）。
+  var opts=['<option value="">（跟随列表第一个：'+esc(c.default_model)+'）</option>'];
+  var options=c.default_model_options||[];
+  options.forEach(function(m){
+    var label=(m.name&&m.name!==m.id)?(m.name+" · "+m.id):m.id;
+    opts.push('<option value="'+esc(m.id)+'"'+(c.default_model===m.id?" selected":"")+'>'+esc(label)+'</option>');
+  });
+  // 一个模型都没启用时（回退内置推荐）说明一句，否则下拉里只有"跟随"会让人困惑
+  if(!options.length){
+    opts.push('<option value="" disabled>还没有启用任何模型</option>');
+  }
+  $("setDefaultModel").innerHTML=opts.join("");
+
+  // 请求头：内置值做占位提示，当前的覆盖值填进输入框
+  var def=c.default_headers||{}, cur=c.headers||{};
+  var keys=Object.keys(def);
+  Object.keys(cur).forEach(function(k){ if(keys.indexOf(k)<0) keys.push(k); });
+  keys.sort();
+  $("hdrGrid").innerHTML=keys.map(function(k){
+    return '<div><label title="'+esc(k)+'">'+esc(k)+'</label>'+
+      '<input data-hdr="'+esc(k)+'" value="'+esc(cur[k]||"")+'" placeholder="'+esc(def[k]||"")+'">'+
+    '</div>';
+  }).join("")||'<div class="desc">没有可配置的请求头。</div>';
+
+  $("setNote").textContent="读取于 "+fmtClock(Date.now());
+  $("setPersist").innerHTML = c.persisted
+    ? '<div class="okbox">设置在本地会自动存盘（<code>~/.cline-free-state.local.json</code>），重启不丢。</div>'
+    : '<div class="warnbox">当前运行环境没有可写磁盘（云端部署），改动只对本次实例生效，重启或重新部署后恢复。<br>'+
+      '要长期保留：本地运行本服务，或把改动写进部署环境变量。</div>';
+}
+
+function saveSettings(btn){
+  var hdrs={};
+  var inputs=$("hdrGrid").querySelectorAll("input[data-hdr]");
+  for(var i=0;i<inputs.length;i++){
+    var k=inputs[i].getAttribute("data-hdr"), v=inputs[i].value.trim();
+    if(v) hdrs[k]=v;
+  }
+  var payload={
+    strategy:$("setStrategy").value,
+    cooldown_minutes:Number($("setCooldown").value),
+    default_model:$("setDefaultModel").value,
+    override_prompt:$("setOverride").value,
+    headers:hdrs,
+    // 请求头整体替换：输入框里空着的行就是要删掉的头，合并语义删不掉
+    replace_headers:true
+  };
+  if(btn){ btn.disabled=true; flash(btn,"保存中"); }
+  fetch("/v1/config",{method:"POST",headers:authHeaders(),body:JSON.stringify(payload)})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("保存失败",o.d,"HTTP "+o.r.status); return; }
+      renderSettings(o.d);
+      toast("ok","设置已保存","");
+      // 策略/默认模型也会影响健康页展示，顺手刷新
+      loadHealth();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("保存请求失败",e); });
+}
+
+function resetHeaders(){
+  var inputs=$("hdrGrid").querySelectorAll("input[data-hdr]");
+  for(var i=0;i<inputs.length;i++) inputs[i].value="";
+  $("setNote").textContent="已清空覆盖值（内置默认仍生效），点「保存设置」提交";
 }
 
 function renderUsage(){
@@ -3921,131 +7186,6 @@ function renderUsage(){
   $("cnt-usage").textContent=t.total?fmtTok(t.total):"";
 }
 
-function testModel(id){
-  var m=null;
-  for(var i=0;i<state.models.length;i++) if(state.models[i].id===id){ m=state.models[i]; break; }
-  if(!m||(m.test&&m.test.busy)) return;
-  m.test={busy:true,ok:false,ttft:null,tps:null};
-  renderMRows();
-  var ctrl=new AbortController();
-  var timer=setTimeout(function(){ try{ctrl.abort();}catch(e){} },40000);
-  var t0=performance.now(), ttft=null, chars=0, tokens=null, usage=null, early=false;
-  var body={model:id,stream:true,messages:[{role:"user",content:"从 1 数到 25，用英文逗号分隔，只输出数字本身。"}]};
-  var reqBody=JSON.stringify(body,null,2);
-
-  fetch("/v1/chat/completions",{method:"POST",headers:authHeaders(),body:JSON.stringify(body),signal:ctrl.signal})
-    .then(function(r){
-      if(!r.ok){
-        return r.text().then(function(txt){
-          clearTimeout(timer);
-          m.test={ok:false,ttft:null,tps:null,error:"HTTP "+r.status,hint:explain(r.status,txt)};
-          renderMRows(); renderMStats();
-          addLog({kind:"test",model:id,stream:true,ok:false,status:r.status,error:"HTTP "+r.status+" "+txt.slice(0,400),hint:explain(r.status,txt),requestBody:reqBody,responseRaw:txt.slice(0,4000)});
-          persistTest(id,m.test);
-        });
-      }
-      var reader=r.body.getReader(), dec=new TextDecoder(), buf="";
-      function pump(){
-        return reader.read().then(function(s){
-          if(s.done) return null;
-          buf+=dec.decode(s.value,{stream:true});
-          var ix;
-          while((ix=buf.indexOf("\\n"))>=0){
-            var line=buf.slice(0,ix); buf=buf.slice(ix+1);
-            if(line.indexOf("data:")!==0) continue;
-            var p=line.slice(5).trim();
-            if(!p||p==="[DONE]") continue;
-            try{
-              var o=JSON.parse(p), c=o.choices&&o.choices[0], dl=(c&&c.delta)||{};
-              if(ttft===null&&(dl.content||dl.reasoning)) ttft=performance.now()-t0;
-              if(dl.content) chars+=dl.content.length;
-              if(o.usage) usage=o.usage;
-            }catch(e){}
-          }
-          if(usage||chars>=120){ early=true; try{ctrl.abort();}catch(e){} return null; }
-          return pump();
-        });
-      }
-      return pump().then(function(){
-        clearTimeout(timer);
-        var totalMs=performance.now()-t0;
-        if(usage) tokens=usage.completion_tokens||null;
-        var genMs=Math.max(totalMs-(ttft||0),1);
-        var tps=tokens? tokens/(genMs/1000) : (chars? chars/(genMs/1000) : null);
-        if(ttft===null){
-          m.test={ok:false,ttft:null,tps:null,error:"无响应内容",hint:"上游返回 200 但没有内容，重试通常即可。"};
-        } else {
-          m.test={ok:true,ttft:ttft,tps:tps,basis:tokens?"token":"chars",tokens:tokens,chars:chars,genMs:genMs,totalMs:totalMs,early:early};
-        }
-        renderMRows(); renderMStats();
-        addLog({kind:"test",model:id,stream:true,ok:m.test.ok,status:200,ttft:m.test.ttft,totalMs:totalMs,genMs:genMs,tokens:tokens,chars:chars,tps:tps,tpsBasis:m.test.basis,
-          promptTokens:usage?usage.prompt_tokens:null,completionTokens:usage?usage.completion_tokens:null,totalTokens:usage?usage.total_tokens:null,
-          reasoningTokens:usage&&usage.completion_tokens_details?usage.completion_tokens_details.reasoning_tokens:null,
-          stopped:early,note:"模型页测速，拿到样本后主动中止",error:m.test.ok?null:m.test.error,hint:m.test.ok?null:m.test.hint,
-          requestBody:reqBody,responseRaw:usage?JSON.stringify(usage,null,2):"已中止（未取得 usage）"});
-        persistTest(id,m.test);
-      });
-    })
-    .catch(function(e){
-      clearTimeout(timer);
-      var stopped=String(e&&e.name)==="AbortError";
-      if(stopped&&ttft!==null){
-        var tm=performance.now()-t0, gm=Math.max(tm-ttft,1);
-        m.test={ok:true,ttft:ttft,tps:tokens?tokens/(gm/1000):(chars?chars/(gm/1000):null),basis:tokens?"token":"chars",tokens:tokens,chars:chars,genMs:gm,totalMs:tm,early:true};
-      } else {
-        m.test={ok:false,ttft:null,tps:null,error:stopped?"超时":String(e&&e.message||e).slice(0,80),hint:stopped?"40 秒内没有收到内容，可能上游繁忙或该模型不可用。":"请求异常，检查服务是否在运行。"};
-      }
-      renderMRows(); renderMStats();
-      addLog({kind:"test",model:id,stream:true,ok:m.test.ok,status:m.test.ok?200:null,ttft:m.test.ttft,totalMs:m.test.totalMs,genMs:m.test.genMs,
-        tokens:m.test.tokens,chars:m.test.chars,tps:m.test.tps,tpsBasis:m.test.basis,stopped:m.test.early,note:"模型页测速",
-        error:m.test.ok?null:m.test.error,hint:m.test.ok?null:m.test.hint,requestBody:reqBody});
-      persistTest(id,m.test);
-    })
-    .then(function(){
-      if(m.test) delete m.test.busy;
-      state.testingIds[id]=m.test||null;
-      renderMRows();
-    });
-}
-function persistTest(id,t){
-  var saved=load(LS.tests,{})||{};
-  saved[id]={ok:!!t.ok,ttft:t.ttft||null,tps:t.tps||null,basis:t.basis||null,tokens:t.tokens||null,chars:t.chars||null,
-    genMs:t.genMs||null,totalMs:t.totalMs||null,error:t.error||null,hint:t.hint||null,at:Date.now()};
-  var ks=Object.keys(saved);
-  if(ks.length>80){
-    ks.sort(function(a,b){ return (saved[a].at||0)-(saved[b].at||0); });
-    for(var i=0;i<ks.length-80;i++) delete saved[ks[i]];
-  }
-  save(LS.tests,saved);
-}
-function testAll(){
-  if(state.testing) return;
-  var targets=visibleModels().map(function(m){return m.id;});
-  if(!targets.length) return;
-  state.testing=true;
-  $("btnTestAll").disabled=true; $("btnStopTest").hidden=false; $("mBar").hidden=false;
-  $("mBar").querySelector("i").style.width="0%";
-  var i=0;
-  function next(){
-    if(!state.testing||i>=targets.length){
-      state.testing=false; $("btnTestAll").disabled=false; $("btnStopTest").hidden=true;
-      setTimeout(function(){ $("mBar").hidden=true; },900);
-      return;
-    }
-    var id=targets[i++];
-    testModel(id);
-    // 等这个模型测完再做下一个（轮询 busy 标记）
-    var waited=0;
-    (function wait(){
-      var mm=null;
-      for(var k=0;k<state.models.length;k++) if(state.models[k].id===id){ mm=state.models[k]; break; }
-      if((mm&&mm.test&&mm.test.busy)&&waited<45000){ waited+=250; setTimeout(wait,250); return; }
-      $("mBar").querySelector("i").style.width=Math.round(i/targets.length*100)+"%";
-      setTimeout(next,250);
-    })();
-  }
-  next();
-}
 
 /* ══ 对话 ══ */
 function renderThread(){
@@ -4448,49 +7588,127 @@ document.querySelectorAll(".chip").forEach(function(c){
 });
 $("btnClearLogs").addEventListener("click",function(){ state.logs=[]; state.selId=null; save(LS.logs,[]); renderLogs(); });
 $("btnExportLogs").addEventListener("click",exportLogs);
-$("mRows").addEventListener("click",function(e){
-  var t=e.target.closest&&e.target.closest("[data-test]");
-  if(t){ testModel(t.getAttribute("data-test")); return; }
-  var u=e.target.closest&&e.target.closest("[data-use]");
-  if(u){
-    state.model=u.getAttribute("data-use"); $("model").value=state.model; save(LS.model,state.model);
-    renderSnip(); showTab("chat");
+/* 模型库：一个委托处理三种卡片上的动作（推荐分组 / 全部模型 / 已启用三处共用）。
+   卡片会整块重绘，所以只能走事件委托，不能逐个绑定。 */
+document.addEventListener("click",function(e){
+  var t=e.target.closest&&e.target.closest("button[data-add]");
+  if(t){ addModelIds([t.getAttribute("data-add")],"已添加"); return; }
+  var g=e.target.closest&&e.target.closest("button[data-addgroup]");
+  if(g){
+    var key=g.getAttribute("data-addgroup");
+    var groups=(state.mLibGroups||[]).concat(state.mCatalog||[]);
+    var hit=null;
+    for(var i=0;i<groups.length;i++) if(groups[i].key===key){ hit=groups[i]; break; }
+    if(!hit){ toast("warn","找不到该分组","请点「刷新数据」后重试。"); return; }
+    addModelIds(hit.models.map(function(m){ return m.id; }),"已添加整组");
+    return;
   }
+  var c=e.target.closest&&e.target.closest("button[data-check]");
+  if(c){ checkModel(c.getAttribute("data-check"),c); return; }
+  var rm=e.target.closest&&e.target.closest("button[data-rm]");
+  if(rm){ removeModel(rm.getAttribute("data-rm"),rm); return; }
+  var sd=e.target.closest&&e.target.closest("button[data-setdefault]");
+  if(sd){ setDefaultModel(sd.getAttribute("data-setdefault"),sd); return; }
+  var cp=e.target.closest&&e.target.closest("button[data-copyid]");
+  if(cp){ copyText(cp.getAttribute("data-copyid"),cp); return; }
 });
-document.querySelectorAll("table.m th.sort").forEach(function(th){
-  th.addEventListener("click",function(){
-    var k=th.getAttribute("data-s");
-    if(state.sort===k) state.sortDir=-state.sortDir;
-    else { state.sort=k; state.sortDir=1; }
-    document.querySelectorAll("table.m th.sort .ar").forEach(function(a){ a.remove(); });
-    var ar=document.createElement("span"); ar.className="ar"; ar.textContent=state.sortDir>0?"↑":"↓";
-    th.appendChild(ar);
-    save(LS.sort,{key:state.sort,dir:state.sortDir});
-    renderMRows();
+/* 全部模型的搜索：只过滤本地已有数据，不发请求。
+   绑 input（覆盖键盘与粘贴）与 search（type=search 自带的清除按钮不一定触发 input），
+   外加 Esc 清空。 */
+(function(){
+  var el=$("mCatSearch");
+  el.addEventListener("input",function(){ renderModelCatalog(); });
+  el.addEventListener("search",function(){ renderModelCatalog(); });
+  el.addEventListener("keydown",function(e){
+    if(e.key==="Escape"){ el.value=""; renderModelCatalog(); }
   });
+})();
+// 全部模型折叠块：展开时才抓（上游 440+ 条、约 500 KB，没必要在页面加载时一起拉）
+$("mCatalogFold").addEventListener("toggle",function(){
+  if(!this.open) return;
+  if(state.mCatLoaded){ renderModelCatalog(); return; }
+  loadModelCatalog(false);
 });
-$("mfilter").addEventListener("input",function(){ renderMRows(); });
-$("mfree").addEventListener("change",function(){ save(LS.freeOnly,this.checked); renderMRows(); renderMStats(); });
-$("mcn").addEventListener("change",function(){ renderMRows(); });
-$("btnReloadModels").addEventListener("click",function(){ loadModels(); });
-$("btnTestAll").addEventListener("click",testAll);
-$("btnStopTest").addEventListener("click",function(){ state.testing=false; });
+$("mRefreshBtn").addEventListener("click",function(){
+  loadModelLibrary(true);
+  if(state.mCatLoaded) loadModelCatalog(true);
+});
+$("mDescBtn").addEventListener("click",function(){
+  var on=document.body.classList.toggle("show-mdesc");
+  this.textContent=on?"隐藏描述":"显示描述";
+});
 $("btnRefreshAcct").addEventListener("click",function(){ loadHealth(); });
 $("btnLogin").addEventListener("click",startLogin);
 
 /* 账号卡片上的动作按钮与批量按钮：统一走事件委托，
    这样 renderAccts 重绘多少次都不用重新绑定。 */
 function onAcctBarClick(e){
+  // 详情/余额按钮不带 data-act（它们不发账号动作请求），单独处理
+  var db=e.target.closest&&e.target.closest("button[data-detail]");
+  if(db){ openAcctDetail(db.getAttribute("data-detail")); return; }
+  var bb=e.target.closest&&e.target.closest("button[data-balance]");
+  if(bb){
+    // 余额也走弹窗：这样「查不到原因」的提示能一起显示，而不是只弹个 toast
+    openAcctDetail(bb.getAttribute("data-balance"));
+    setTimeout(function(){ var b=$("btnBal"); if(b) b.click(); }, 400);
+    return;
+  }
+  var cb=e.target.closest&&e.target.closest("button[data-clear]");
+  if(cb){
+    accountAction("clearCooldown",cb.getAttribute("data-clear"),cb,cb.getAttribute("data-model"));
+    return;
+  }
   var b=e.target.closest&&e.target.closest("button[data-act]");
   if(!b) return;
   var act=b.getAttribute("data-act"), id=b.getAttribute("data-id")||"";
   // 破坏性动作先确认：移除账号无法撤销（停用可以随时启用，不必打扰）
-  if(act==="remove"&&!confirm("移除这个临时账号？\\n\\n它只存在于当前实例内存，移除后需要重新登录才能恢复。")) return;
+  if(act==="remove"&&!confirm("移除这个账号？\\n\\n移除后需要重新登录才能恢复。")) return;
   accountAction(act,id,b);
 }
 $("accts").addEventListener("click",onAcctBarClick);
+// 详情弹窗里的「解除冷却」也走同一套动作
+document.addEventListener("click",function(e){
+  var cb=e.target.closest&&e.target.closest("button[data-clear]");
+  if(!cb) return;
+  if($("accts").contains(cb)) return;   // 卡片上的已由上面的委托处理
+  accountAction("clearCooldown",cb.getAttribute("data-clear"),cb,cb.getAttribute("data-model"));
+});
 $("btnEnableAll").addEventListener("click",function(){ accountAction("enableAll","",this); });
 $("btnResetAll").addEventListener("click",function(){ accountAction("resetAll","",this); });
+
+/* 上游渠道面板与设置页的事件委托（面板会整体重绘，不能逐个绑定） */
+document.addEventListener("click",function(e){
+  var t=e.target.closest&&e.target.closest(
+    "button[data-upsave], button[data-updel], button[data-upprobe]");
+  if(!t) return;
+  if(t.hasAttribute("data-upsave")) return upSave(t.getAttribute("data-upsave"),t);
+  if(t.hasAttribute("data-updel")) return upDelete(t.getAttribute("data-updel"),t);
+  upProbe(t.getAttribute("data-upprobe"),t);
+});
+$("btnUpAdd").addEventListener("click",function(){
+  var id=$("upModel").value.trim();
+  if(!id){ toast("warn","请先选择模型","从下拉里挑一个模型 ID，或直接粘贴。"); return; }
+  // 直接建一条空配置（服务端对空配置视为「无有效内容」而删除，所以先给个占位渠道）
+  // —— 这里改为：建一条只有 pinMode 的配置，让用户填完再保存。
+  fetch("/v1/upstreams?action=save",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:id,config:{pinMode:"strict",upstreams:[]}})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){ toastError("添加失败",d); return; }
+      $("upModel").value="";
+      // 空配置会被服务端判为无效而删除，此时提示用户先填渠道
+      if(!d.config){ toast("warn","已就绪","该模型还没有有效配置，填好钉住的渠道后点「保存」。"); }
+      loadUpstreams().then(function(){
+        var el=document.querySelector('.upcard[data-model="'+id+'"] input[data-up="upstreams"]');
+        if(el) el.focus();
+      });
+    })
+    .catch(function(err){ toastError("添加请求失败",err); });
+});
+$("btnUpReload").addEventListener("click",loadUpstreams);
+$("btnSetSave").addEventListener("click",function(){ saveSettings(this); });
+$("btnSetReload").addEventListener("click",function(){ loadSettings(); });
+$("btnHdrReset").addEventListener("click",resetHeaders);
 $("btnLoginCancel").addEventListener("click",cancelLogin);
 $("btnSend").addEventListener("click",send);
 $("btnStop").addEventListener("click",stopGen);
@@ -4576,12 +7794,22 @@ function errorResponse(e) {
     const human = mins >= 60
       ? `${Math.floor(mins / 60)}h ${mins % 60}m`
       : mins >= 1 ? `${mins}m` : `${secs}s`;
+    // 冷却已经是「账号×模型」级：说清是**哪个模型**没额度，比只说"所有账号"
+    // 有用得多——用户换个模型可能就能继续用。
+    const kindText = {
+      free_daily: "免费日额度已用尽", pass_limit: "订阅额度已用尽",
+      spend_limit: "已达花费上限", empty: "上游持续返回空响应",
+    };
+    const kinds = [...new Set((e.kinds || []).filter((k) => k && k !== "unknown"))]
+      .map((k) => kindText[k] || k);
+    const why = kinds.length ? "（" + kinds.join("、") + "）" : "";
     return jsonResponse({
       error: {
-        message: `所有账号（${e.accountCount} 个）的免费额度均在冷却中，约 ${human} 后恢复。` +
-                 `可等待冷却结束，或在 CLINE_REFRESH_TOKEN 中追加更多账号。`,
+        message: `${e.accountCount} 个账号的「${e.modelId || "该模型"}」额度均在冷却中${why}，约 ${human} 后恢复。` +
+                 `\n可以：等冷却结束、改用其它模型，或在「账号」页追加更多账号。`,
         type: "rate_limit_error",
         reason: "all_accounts_cooling",
+        model: e.modelId || null,
         retry_after_seconds: secs,
       },
     }, 429, { "Retry-After": String(secs) });
@@ -4596,6 +7824,19 @@ function errorResponse(e) {
       },
     }, 429);
   }
+  if (e && e.message === "all_accounts_refresh_failed") {
+    // 全部账号的 token 刷新都失败：这是最需要明确指引的一种故障——
+    // 常见成因是 refreshToken 被上游轮换/作废，而用户看到的只是「请求失败」。
+    return jsonResponse({
+      error: {
+        message: `账号池里 ${e.accountCount} 个账号的 token 刷新全部失败` +
+                 (e.detail ? `（最后一次：${e.detail}）` : "") + "。\n" +
+                 (e.permanentHint || "可能是网络抖动，稍后重试；若持续失败请在控制台「账号」页重新登录。"),
+        type: "account_error",
+        reason: "all_accounts_refresh_failed",
+      },
+    }, 502);
+  }
   if (e && e.message === "缺少 CLINE_REFRESH_TOKEN 环境变量") {
     return jsonResponse({
       error: {
@@ -4605,6 +7846,12 @@ function errorResponse(e) {
         reason: "missing_refresh_token",
       },
     }, 500);
+  }
+  // 客户端主动断开：不必回响应（对方已经不在了），但也不该记成 500
+  if (e && (e.name === "AbortError" || String(e.message || "").includes("client_aborted"))) {
+    return jsonResponse({
+      error: { message: "客户端已断开请求", type: "cancelled" },
+    }, 499);
   }
   return jsonResponse({ error: { message: (e && e.message) || String(e), type: "api_error" } }, 500);
 }

@@ -10,13 +10,24 @@
  *       响应再转回 Node http（支持 SSE 流式透传）。生产代码 worker.js 不做任何改动。
  */
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, renameSync, unlinkSync, copyFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 8787);
+
+/**
+ * 监听地址。默认只绑回环（127.0.0.1），不要图省事绑 0.0.0.0：
+ * 这个服务把自己登录过的账号额度开放给任何能访问它的人，而控制台页面会把
+ * API_KEY 注入进去（本地首次运行自动生成的那个）。绑 0.0.0.0 等于把钥匙
+ * 连同门一起送给同网段的人。
+ *
+ * 确实要让别的机器连（比如手机）时显式设 HOST=0.0.0.0，并自己配置
+ * API_KEY ——此时浏览器打开控制台仍会拿到 key，请只在可信网络里这么做。
+ */
+const HOST = (process.env.HOST || "127.0.0.1").trim() || "127.0.0.1";
 
 // ---- 读取 .env.local（简易解析，不引依赖）----
 function loadEnvLocal() {
@@ -102,7 +113,8 @@ if (keyInfo.generated) {
 } else {
   console.log("API_KEY             :", keyInfo.key, keyInfo.why === "env" ? "(来自环境变量)" : "(来自 .env.local)");
 }
-console.log("监听地址            : http://localhost:" + PORT);
+console.log("监听地址            : http://" + (HOST === "0.0.0.0" ? "localhost" : HOST) + ":" + PORT +
+  (HOST === "0.0.0.0" ? "  ⚠ 已绑所有网卡，同网段的人都能访问并拿到页面里的 API_KEY" : "  （仅本机可访问）"));
 console.log("-".repeat(64));
 console.log("端点：");
 console.log(`  GET  http://localhost:${PORT}/           控制台（浏览器打开）`);
@@ -111,6 +123,11 @@ console.log(`  GET  http://localhost:${PORT}/v1/models`);
 console.log(`  POST http://localhost:${PORT}/v1/chat/completions`);
 console.log(`  POST http://localhost:${PORT}/v1/messages      (Anthropic 格式)`);
 console.log("=".repeat(64));
+
+// 落盘目录：放用户主目录而不是项目目录，避免误提交（.gitignore 里 *.local 也能挡，
+// 但多一层保险不亏）。两个文件都不大。
+const HOME_DIR = process.env.USERPROFILE || process.env.HOME || __dirname;
+console.log("设置与账号存盘：" + join(HOME_DIR, ".cline-free-state.local.json"));
 
 /**
  * Token 统计的本地持久化。
@@ -122,10 +139,7 @@ console.log("=".repeat(64));
  * 放在 USERPROFILE / HOME 而不是项目目录，是为了避免误提交 —— 虽然 .gitignore 里
  * 的 *.local 已经能挡住，但多一层保险不亏。文件很小（几十 KB 上限）。
  */
-const USAGE_FILE = join(
-  process.env.USERPROFILE || process.env.HOME || __dirname,
-  ".cline-free-usage.local.json"
-);
+const USAGE_FILE = join(HOME_DIR, ".cline-free-usage.local.json");
 
 function loadUsageSnapshot() {
   try {
@@ -147,11 +161,88 @@ function saveUsageSnapshot(snap) {
   }
 }
 
-/** 把持久化钩子接到当前 worker 模块上，并装回上次的统计。
- *  ⚠️ 顺序很关键：worker.js 在模块顶层会重设 globalThis.__clineUsage，所以
- *  新版一导入，全局引用就指向新实例了。旧实例的计数必须先冲刷出去，
- *  否则热重载会把上次写盘之后的增量悄悄丢掉。
+/**
+ * 设置与账号池的本地持久化。
+ *
+ * worker.js 本身不碰文件系统（Cloudflare / Vercel 上没有可写磁盘，强上 KV/D1 会
+ * 破坏"单文件复制粘贴即可部署"的定位），它只暴露 globalThis.__clineState 这几个
+ * 钩子；由本地服务负责落盘，所以控制台里改的设置、登录的账号、上游轮换过的
+ * refreshToken 重启都不丢。
+ *
+ * 放在 USERPROFILE / HOME 而不是项目目录，是为了避免误提交 —— 虽然 .gitignore 里
+ * 的 *.local 已经能挡住，但多一层保险不亏。文件里含 refreshToken，权限收到 0600。
+ */
+const STATE_FILE = join(HOME_DIR, ".cline-free-state.local.json");
+
+/**
+ * 原子写：先写临时文件再 rename。
+ *
+ * 不能直接 writeFileSync 覆盖：进程若在截断之后、写入完成之前被杀，会留下一个
+ * 0 字节文件——而状态文件里是用户的 refreshToken，读不出来等于账号全丢。
+ * rename 在同一文件系统内是原子的，写一半崩溃只会留下一个无人引用的 .tmp。
+ */
+function atomicWrite(file, text) {
+  const tmp = file + "." + process.pid + ".tmp";
+  writeFileSync(tmp, text, { encoding: "utf8", mode: 0o600 });
+  try {
+    renameSync(tmp, file);
+  } catch (e) {
+    // 某些文件系统/Windows 上 rename 会被占用挡住。退一步用「先写后截断」：
+    // 中途被杀最坏是「新内容 + 旧内容尾巴」，解析必然失败 → 按损坏处理并留副本，
+    // 而不是像 O_TRUNC 那样直接把文件清空。
+    writeFileSync(file, text, { encoding: "utf8", mode: 0o600 });
+    try { unlinkSync(tmp); } catch (e2) { /* 临时文件残留无害 */ }
+  }
+}
+
+function loadStateSnapshot() {
+  try {
+    if (!existsSync(STATE_FILE)) return null;
+    const txt = readFileSync(STATE_FILE, "utf8");
+    const obj = JSON.parse(txt);
+    return obj && typeof obj === "object" ? obj : null;
+  } catch (e) {
+    // 解析失败：留一份副本再从头开始。
+    // 不留副本的话，下一次保存就把用户唯一的 refreshToken 覆盖掉了。
+    console.error("[state] 读取设置文件失败，从零开始：", String(e.message || e).slice(0, 160));
+    try {
+      const backup = STATE_FILE + ".corrupt-" + Date.now();
+      copyFileSync(STATE_FILE, backup);
+      console.error("[state] 原文件已备份到 " + backup);
+    } catch (e2) {
+      console.error("[state] 副本也留不下来，本次不覆盖原文件：", String(e2.message || e2).slice(0, 120));
+    }
+    return null;
+  }
+}
+
+function saveStateSnapshot(snap) {
+  try {
+    atomicWrite(STATE_FILE, JSON.stringify(snap, null, 2));
+  } catch (e) {
+    console.error("[state] 写入设置文件失败：", String(e.message || e).slice(0, 160));
+  }
+}
+
+/** 把持久化钩子接到当前 worker 模块上，并装回上次的设置。
+ *  ⚠️ 顺序很关键：worker.js 在模块顶层会重设 globalThis.__clineState，所以
+ *  新版一导入，全局引用就指向新实例了。旧实例的改动必须先冲刷出去，
+ *  否则热重载会把上次写盘之后的改动悄悄丢掉。
  *  也因此这里不用 globalThis 上的引用去冲旧实例，而是调用方传来的 prevApi。 */
+function attachStatePersistence(prevApi) {
+  const api = globalThis.__clineState;
+  if (!api) return false;
+  if (prevApi && prevApi !== api) {
+    try { prevApi.flushStateNow(); } catch (e) { /* 旧实例冲刷失败无补救手段 */ }
+  }
+  api.setStatePersistence(saveStateSnapshot);
+  const snap = loadStateSnapshot();
+  if (snap) api.restoreState(snap);
+  return true;
+}
+
+/** 把 token 统计的持久化钩子接到当前 worker 模块上，并装回上次的统计。
+ *  ⚠️ 顺序同样关键：旧实例的计数必须先冲刷出去（见 attachStatePersistence）。 */
 function attachUsagePersistence(prevApi) {
   const api = globalThis.__clineUsage;
   if (!api) return false;
@@ -179,14 +270,16 @@ async function getWorker() {
   try {
     const mtime = statSync(workerPath).mtimeMs;
     if (!worker || mtime !== workerMtime) {
-      // 先记下旧实例的统计句柄：新模块顶层会把 globalThis.__clineUsage 覆盖掉
-      const prevApi = globalThis.__clineUsage;
+      // 先记下旧实例的句柄：新模块顶层会把 globalThis.__cline* 覆盖掉
+      const prevUsageApi = globalThis.__clineUsage;
+      const prevStateApi = globalThis.__clineState;
       // 用 query 参数绕开 ESM 模块缓存
       const mod = await import("./worker.js?t=" + mtime);
       worker = mod.default;
       workerMtime = mtime;
       reloads++;
-      attachUsagePersistence(prevApi);
+      attachStatePersistence(prevStateApi);
+      attachUsagePersistence(prevUsageApi);
       if (reloads > 1) console.log(`[hot-reload] worker.js 已更新，已重新加载（第 ${reloads - 1} 次）`);
     }
   } catch (e) {
@@ -252,8 +345,8 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  // 启动时就把 worker 载进来：一是让统计文件立刻被读取（控制台首屏就有数），
+server.listen(PORT, HOST, () => {
+  // 启动时就把 worker 载进来：一是让设置与统计文件立刻被读取（控制台首屏就有数），
   // 二是提前暴露语法错误，而不是等到第一个请求才报
   getWorker().then(() => {
     console.log(`\n✅ 服务已启动，按 Ctrl+C 停止\n`);
@@ -263,12 +356,29 @@ server.listen(PORT, () => {
   });
 });
 
-// 退出前把统计冲刷到磁盘：落盘是防抖的（默认 1.5s），
-// 否则 Ctrl+C 会丢掉最后一两秒的增量
-let usageFlushed = false;
+// 端口被占用时给一句能直接照做的话，而不是抛一个 ERR 堆栈。
+// 最常见的情况是自己已经开了一个窗口在跑（旧进程还占着端口）。
+server.on("error", (err) => {
+  if (err && err.code === "EADDRINUSE") {
+    console.error("\n❌ 端口 " + PORT + " 已被占用。");
+    console.error("   多半是上一个 cline-free 窗口还开着（关掉它，或换个端口）：");
+    console.error("     Windows:  set PORT=8788 && node local-server.js");
+    console.error("     Linux/macOS:  PORT=8788 node local-server.js\n");
+  } else if (err && err.code === "EACCES") {
+    console.error("\n❌ 没有权限绑定 " + HOST + ":" + PORT + "（端口 <1024 需要管理员/root）。\n");
+  } else {
+    console.error("\n❌ 服务启动失败：", String((err && err.message) || err) + "\n");
+  }
+  process.exit(1);
+});
+
+// 退出前把设置与统计冲刷到磁盘：两者都是防抖的（默认 0.8s / 1.5s），
+// 否则 Ctrl+C 会丢掉最后一点改动
+let flushed = false;
 function flushOnExit() {
-  if (usageFlushed) return;
-  usageFlushed = true;
+  if (flushed) return;
+  flushed = true;
+  try { globalThis.__clineState?.flushStateNow(); } catch (e) {}
   try { globalThis.__clineUsage?.flushUsageNow(); } catch (e) {}
 }
 for (const sig of ["SIGINT", "SIGTERM"]) {

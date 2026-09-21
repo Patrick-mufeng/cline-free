@@ -122,6 +122,12 @@ body::after {
 }
 .cell.live { border-color:var(--ok); color:var(--ok); background:var(--ok-soft); }
 .cell.cool { border-color:var(--warn); color:var(--warn); background:var(--warn-soft); }
+/* part：账号可用，只有部分模型在冷却。用左半填充表示「一半」，
+   与整格告警色的 cool 区分开——否则用户会以为这个号完全用不了。 */
+.cell.part {
+  border-color:var(--line); color:var(--ink-2);
+  background-image:linear-gradient(135deg,var(--warn-soft) 0 50%,transparent 50% 100%);
+}
 .cell.tmp { box-shadow:inset 0 -3px 0 var(--accent); }
 .pool .empty { font-size:11px; color:var(--ink-3); line-height:1.5; }
 
@@ -272,6 +278,9 @@ details.rz pre{
 }
 .acct.live{ border-color:var(--ok); }
 .acct.cool{ border-color:var(--warn); }
+/* warn：账号本身可用，只是部分模型在冷却 —— 与「整号不可用」用不同边框区分，
+   否则用户会以为这个号完全用不了 */
+.acct.warn{ border-color:var(--line); }
 .acct.off{ border-color:var(--line); }
 .acct.off .hd .who .ml{ color:var(--ink-3); }
 
@@ -283,6 +292,7 @@ details.rz pre{
 }
 .acct.live .ix{ border-color:var(--ok); color:var(--ok); }
 .acct.cool .ix{ border-color:var(--warn); color:var(--warn); }
+.acct.warn .ix{ border-color:var(--line); color:var(--ink-2); }
 .acct .who{ min-width:0; flex:1; }
 .acct .who .ml{
   display:block; font-size:11.5px; color:var(--ink);
@@ -298,6 +308,7 @@ details.rz pre{
 .badge.live{ border-color:var(--ok); color:var(--ok); background:var(--ok-soft); }
 .badge.cool{ border-color:var(--warn); color:var(--warn); background:var(--warn-soft); }
 .badge.off{ border-color:var(--line); color:var(--ink-3); background:var(--inset); }
+.badge.part{ border-color:var(--line); color:var(--ink-2); background:var(--inset); }
 
 /* 数据区：双列小格 */
 .acct .kv{ display:grid; grid-template-columns:1fr 1fr; flex:1; align-content:start; }
@@ -523,6 +534,150 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
 .spd .h{ height:3px; background:var(--accent); } .spd .h.na{ background:var(--line); }
 .empty{ text-align:center; padding:32px 16px; color:var(--ink-3); font-size:12px; }
 
+/* ══ 弹窗（账号详情等）══
+   复用像素终端语言：直角、2px 描边、硬投影。 */
+.modal-bg{
+  position:fixed; inset:0; z-index:300; background:rgba(0,0,0,.6);
+  display:flex; align-items:center; justify-content:center; padding:20px;
+}
+.modal{
+  background:var(--surface); border:2px solid var(--line); box-shadow:var(--shadow-lg);
+  width:min(880px,100%); max-height:calc(100vh - 40px); display:flex; flex-direction:column;
+}
+.modal > header{
+  display:flex; align-items:center; gap:9px; padding:10px 13px;
+  border-bottom:2px solid var(--line); background:var(--surface-2); flex:none;
+}
+.modal > header h3{ font-size:12.5px; font-weight:700; }
+.modal > .pad{ overflow-y:auto; }
+/* 弹窗内的表格不要用页面级的高度限制，按内容自然撑开由弹窗滚动 */
+.tblwrap.tblfixed{ max-height:none; min-height:0; }
+h4.mh{
+  font-size:11px; color:var(--ink-3); letter-spacing:.06em; text-transform:uppercase;
+  margin:15px 0 7px; padding-bottom:5px; border-bottom:1px solid var(--line-soft);
+}
+h4.mh:first-child{ margin-top:0; }
+.kv2{ display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:9px; }
+.kv2 > div{ background:var(--surface-2); border:2px solid var(--line-soft); padding:8px 10px; }
+.kv2 .k{ display:block; font-size:10px; color:var(--ink-3); letter-spacing:.05em; margin-bottom:3px; }
+.kv2 .v{ font-size:12px; font-variant-numeric:tabular-nums; }
+.kv2 .v.ok{ color:var(--ok); }
+code.chiplite{
+  display:inline-block; font-family:var(--mono); font-size:10.5px; padding:2px 7px;
+  border:1px solid var(--line-soft); color:var(--ink-2); background:var(--surface-2); margin:0 4px 4px 0;
+}
+.modal .desc{ font-size:11px; color:var(--ink-3); margin-bottom:7px; }
+
+/* ══ 模型库（三段式：推荐分组 / 全部模型 / 已启用）══
+   布局对齐 Go 版 cline-proxy 的模型库，但视觉沿用本项目的像素终端语言：
+   直角、2px 描边、硬投影、等宽字体（不搬他的圆角徽章与彩色圆点）。 */
+.mgroup{ border-top:2px solid var(--line-soft); padding-top:11px; margin-top:13px; }
+.mgroup:first-child{ border-top:none; padding-top:0; margin-top:0; }
+.mghead{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:9px; }
+.mghead h4{ font-size:12px; font-weight:700; }
+/* 分组色点：8px 方块而非圆点，与全站的直角语言一致 */
+.gdot{ width:8px; height:8px; flex:none; }
+.mghead .gsub{ font-size:10.5px; color:var(--ink-3); }
+.mghead .note{ font-size:10.5px; color:var(--ink-3); }
+
+.mcards{ display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:8px; }
+.mcard{
+  border:2px solid var(--line-soft); background:var(--surface-2);
+  padding:7px 9px; min-width:0;
+}
+.mcard.on{ border-color:var(--ok); background:var(--ok-soft); }
+.mcard.def{ border-color:var(--accent); }
+/* 卡片内容分两行：第一行是名字（可省略），第二行是操作按钮。
+   按钮单独一行是必需的 —— 挤在同一行时 flex 会把按钮压到逐个字符换行
+   （"检测" 变成竖排的"检/测"），而模型名也会被压到只剩几个字。 */
+.mcard .mrow{ display:flex; align-items:center; gap:7px; min-width:0; }
+.mcard .macts{ display:flex; align-items:center; gap:6px; margin-top:6px; flex-wrap:wrap; }
+/* nowrap 是这套按钮的硬要求：短标签（检测/移除）绝不该折成两行 */
+.mcard button{ white-space:nowrap; flex:none; }
+.mcard .mname{
+  font-size:11.5px; color:var(--ink); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  min-width:0;
+}
+.mcard .mid{
+  font-size:10px; color:var(--ink-3); font-family:var(--mono);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  flex:1 1 auto; min-width:0;
+}
+.mcard .grow{ flex:1; }
+/* 上下文长度与 tags：小方块标签，不用圆角 */
+.mcard .mctx{
+  flex:none; font-size:9.5px; padding:2px 6px; color:var(--ink-2);
+  border:1px solid var(--line); font-variant-numeric:tabular-nums;
+}
+.mcard .mtag{
+  flex:none; font-size:9.5px; padding:2px 6px; color:var(--accent);
+  border:1px solid var(--accent);
+}
+/* 状态徽章（默认）与上下文/标签同一行，留出左边距免得贴在模型名上 */
+.mcard .badge{ flex:none; margin-left:2px; }
+.mcard .mchk{ font-size:10.5px; margin-top:5px; padding-top:4px; border-top:1px solid var(--line-soft); }
+.mcard .mchk.ok{ color:var(--ok); }
+.mcard .mchk.bad{ color:var(--bad); }
+/* 描述默认收起（几百张卡片全铺开描述会把页面撑得没法看），由「显示描述」开关控制 */
+.mcard .mdesc{ display:none; font-size:10.5px; color:var(--ink-3); line-height:1.6; margin-top:5px; }
+body.show-mdesc .mcard .mdesc{ display:block; }
+
+/* 全部模型：折叠块 + 搜索条 */
+.fold{ border:2px solid var(--line-soft); }
+.foldsum{
+  display:flex; align-items:center; gap:9px; cursor:pointer; list-style:none;
+  padding:10px 13px; background:var(--surface-2); user-select:none;
+}
+/* 隐藏 <summary> 的原生三角。三行都要写：::-webkit-details-marker 只对 WebKit 生效，
+   这个浏览器引擎认的是 list-style（上面那行）与 ::marker。少写一行就会多出一个
+   和自绘 chevron 并存的空方块。 */
+.foldsum::-webkit-details-marker{ display:none; }
+.foldsum::marker{ content:""; }
+.foldsum h3{ font-size:12.5px; font-weight:700; }
+/* 折叠标题右侧的计数是纯文本。刻意不复用 .note —— 那是个带 2px 边框的提示条组件，
+   空着的时候会渲染成一个小方块。 */
+.foldsum .fsub{ font-size:10.5px; color:var(--ink-3); }
+.foldsum .grow{ flex:1; }
+/* 展开指示：一个直角三角，用 CSS 边框画，不引图标 */
+.foldsum .chev{
+  flex:none; width:0; height:0; border-left:6px solid var(--ink-3);
+  border-top:5px solid transparent; border-bottom:5px solid transparent;
+  transition:transform .15s;
+}
+details[open] > .foldsum .chev{ transform:rotate(90deg); }
+details.fold > .pad{ border-top:2px solid var(--line); }
+.msearch{ display:flex; align-items:center; gap:9px; margin-bottom:11px; flex-wrap:wrap; }
+.msearch input{ flex:1; min-width:220px; }
+.msearch .note{ font-size:10.5px; color:var(--ink-3); white-space:nowrap; }
+
+/* ══ 上游渠道面板 ══ */
+.upadd{ display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
+.upadd input{ flex:1; min-width:240px; }
+.upcard{ margin-bottom:13px; }
+.upcard header .badge{ flex:none; }
+.upbody{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:11px; padding:11px 13px; }
+.upbody .full{ grid-column:1/-1; }
+.upbody label.lb{ margin-bottom:4px; }
+.upbody textarea{ min-height:56px; }
+.upmeta{ font-size:10.5px; color:var(--ink-3); line-height:1.7; }
+.upmeta code{ font-family:var(--mono); color:var(--ink-2); }
+/* 探测结果条：管道归属 + 实际命中渠道，一眼看出钉住生效没有 */
+.probe{ border:2px solid var(--line-soft); background:var(--surface-2); padding:9px 11px; font-size:11px; line-height:1.75; }
+.probe .row{ display:flex; gap:7px; flex-wrap:wrap; }
+.probe .k{ color:var(--ink-3); }
+.probe .ok{ color:var(--ok); }
+.probe .bad{ color:var(--bad); }
+.probe .warn{ color:var(--warn); }
+.probe .note{ margin-top:6px; color:var(--ink-2); border-top:1px solid var(--line-soft); padding-top:6px; }
+/* system prompt / 请求头表单 */
+.hdrgrid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:9px; }
+.hdrgrid > div{ display:flex; align-items:center; gap:8px; }
+.hdrgrid label{ flex:none; width:150px; font-size:11px; color:var(--ink-2); font-family:var(--mono);
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.hdrgrid input{ flex:1; min-width:0; }
+.warnbox{ border:2px solid var(--warn); background:var(--warn-soft); color:var(--ink); padding:9px 11px; font-size:11.5px; line-height:1.7; }
+.okbox{ border:2px solid var(--ok); background:var(--ok-soft); padding:9px 11px; font-size:11.5px; }
+
 /* ══ 日志：固定高度滚动窗口 ══ */
 .logwrap{ flex:1; min-height:0; display:grid; grid-template-columns:1fr 340px; gap:0; }
 @media (max-width:1100px){ .logwrap{ grid-template-columns:1fr; } .logdetail{ border-left:none !important; border-top:2px solid var(--line); max-height:44vh; } }
@@ -610,6 +765,8 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
       <li><a data-v="usage"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 13.5h11"/><path d="M4.6 13.5V8.6M8 13.5V3.6M11.4 13.5V6.4"/></svg>统计<span class="cnt" id="cnt-usage"></span></a></li>
       <li><a data-v="logs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>日志<span class="cnt" id="cnt-log"></span></a></li>
       <li><a data-v="config"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>接入配置</a></li>
+      <li><a data-v="upstreams"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 4h4M9.5 4h4M2.5 12h4M9.5 12h4"/><circle cx="8" cy="4" r="1.6"/><circle cx="8" cy="12" r="1.6"/><path d="M8 5.6v4.8"/></svg>上游渠道<span class="cnt" id="cnt-up"></span></a></li>
+      <li><a data-v="settings"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/><circle cx="5.5" cy="4.5" r="1.5" fill="currentColor" stroke="none"/><circle cx="10.5" cy="8" r="1.5" fill="currentColor" stroke="none"/><circle cx="6.5" cy="11.5" r="1.5" fill="currentColor" stroke="none"/></svg>设置</a></li>
     </ul>
 
     <div class="pool">
@@ -731,38 +888,69 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
       </section>
 
       <!-- ── 模型 ── -->
+      <!-- ── 模型 ──
+           三段式布局（对齐 Go 版 cline-proxy 的模型库）：
+             ① 可用模型分组 —— 官方推荐/free/Pass/Cloud，卡片墙 + 整组添加
+             ② 全部模型     —— 折叠，展开才抓（上游 440+ 条、约 500 KB），按供应商分组
+             ③ 已启用模型   —— 真正会出现在 /v1/models 里的那些
+           卡片交互三处共用同一套渲染函数，格式与行为完全一致。 -->
       <section class="view" id="v-models" hidden>
         <div class="box">
           <header>
-            <h3>模型列表</h3>
+            <h3>模型库</h3>
             <span class="grow"></span>
-            <span class="note" id="mNote"></span>
-            <button class="xs ghost" id="btnReloadModels">重新拉取</button>
+            <span class="note" id="mStatus"></span>
+            <button class="xs ghost" id="mDescBtn" title="显示/隐藏上游的模型描述">显示描述</button>
+            <button class="xs ghost" id="mRefreshBtn">刷新数据</button>
           </header>
           <div class="pad">
-            <div class="mactions" style="margin-bottom:11px">
-              <div style="flex:1;min-width:170px"><label class="lb" for="mfilter">筛选模型 ID</label><input id="mfilter" placeholder="如 deepseek、qwen、:free"></div>
-              <label class="chk" style="padding-bottom:6px"><input type="checkbox" id="mfree" checked> 只看免费</label>
-              <label class="chk" style="padding-bottom:6px"><input type="checkbox" id="mcn"> 只看国产</label>
-              <button class="primary" id="btnTestAll" style="margin-bottom:1px">测试全部</button>
-              <button class="ghost" id="btnStopTest" style="margin-bottom:1px" hidden>停止</button>
+            <p class="desc">
+              数据来自 <code>api.cline.bot</code>（由服务端抓取 —— 浏览器直连会被 CORS 拦截）。
+              点分组标题右侧的「全部添加」可一键加入该组所有模型，点单个模型卡片上的 ＋ 单独添加；
+              重复添加会自动跳过。也可点「检测」先发一次小请求确认它现在能不能用（可能消耗少量额度）。
+            </p>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>可用模型分组</h3><span class="grow"></span><span class="note" id="mLibNote"></span></header>
+          <div class="pad" id="mLibrary">
+            <div class="empty">加载中…</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <details class="fold" id="mCatalogFold">
+            <summary class="foldsum">
+              <h3>全部模型</h3>
+              <span class="fsub" id="mCatNote"></span>
+              <span class="chev"></span>
+            </summary>
+            <div class="pad">
+              <p class="desc">
+                上游全部可选模型（含付费档），展开后才抓取，服务端缓存 30 分钟。
+                按供应商（模型 ID 里 <code>/</code> 前那一段）分组，每组标题右侧都能「全部添加」。
+              </p>
+              <div class="msearch">
+                <input type="search" id="mCatSearch" placeholder="搜索名称或 ID（如 gpt、qwen、flash）" autocomplete="off" spellcheck="false">
+                <span class="note" id="mCatCount"></span>
+              </div>
+              <div id="mCatalog"><div class="empty">展开后加载…</div></div>
             </div>
-            <div class="stats" id="mStats" style="margin-bottom:11px"></div>
-            <div class="bar" id="mBar" hidden style="margin-bottom:11px"><i></i></div>
-            <div class="tblwrap">
-              <table class="m">
-                <thead><tr>
-                  <th class="sort" data-s="region" style="width:9%">地区</th>
-                  <th class="sort" data-s="id" style="width:33%">模型 ID</th>
-                  <th style="width:9%">类型</th>
-                  <th class="sort" data-s="speed" style="width:16%">输出速度</th>
-                  <th class="sort" data-s="ttft" style="width:10%">首字节</th>
-                  <th style="width:23%"></th>
-                </tr></thead>
-                <tbody id="mRows"></tbody>
-              </table>
-            </div>
-            <div class="empty" id="mEmpty" hidden>没有符合条件的模型。</div>
+          </details>
+        </div>
+
+        <div class="box">
+          <header>
+            <h3>已启用模型</h3>
+            <span class="grow"></span>
+            <span class="note" id="mOwnNote"></span>
+          </header>
+          <div class="pad">
+            <p class="desc" id="mOwnHint">
+              只有这里的模型会出现在 <code>/v1/models</code> 里。点「移除」即可撤下。
+            </p>
+            <div id="mOwned"></div>
           </div>
         </div>
       </section>
@@ -917,6 +1105,98 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
           </div>
         </div>
       </section>
+
+      <!-- ── 上游渠道 ──
+           按模型指定走哪条上游渠道。核心概念：Cline 网关后面有两条路由管道
+           （direct=OpenRouter / planner=Vercel Gateway），钉住的写法互不通用，
+           所以这里要么先探测、要么两种形式同时注入。 -->
+      <section class="view" id="v-upstreams" hidden>
+        <div class="box">
+          <header>
+            <h3>按模型钉住上游渠道</h3>
+            <span class="grow"></span>
+            <span class="note" id="upNote"></span>
+            <button class="xs ghost" id="btnUpReload">刷新</button>
+          </header>
+          <div class="pad">
+            <p class="desc">
+              留空 = 自动模式（由网关自己挑渠道并自带故障转移，实测最稳）。
+              钉住用于：某个渠道总是坏、要优先用便宜/快的渠道、或想把模型 ID 重定向到新名字。
+              <b>只有探测过才知道这个模型走哪条管道</b>，所以先点「探测」再钉。
+            </p>
+            <div class="upadd">
+              <input id="upModel" list="upModelList" placeholder="模型 ID，例如 cline-free/deepseek-v4.1-flash">
+              <datalist id="upModelList"></datalist>
+              <button class="primary" id="btnUpAdd">添加配置</button>
+            </div>
+          </div>
+        </div>
+        <div id="upList"></div>
+      </section>
+
+      <!-- ── 设置 ── -->
+      <section class="view" id="v-settings" hidden>
+        <div class="grid2">
+          <div class="box">
+            <header><h3>调度</h3></header>
+            <div class="pad">
+              <label class="lb" for="setStrategy">轮换策略</label>
+              <select id="setStrategy" style="margin-bottom:11px">
+                <option value="round_robin">round_robin — 逐个轮换（默认）</option>
+                <option value="fill">fill — 先用满一个号，再换下一个</option>
+                <option value="random">random — 随机挑一个</option>
+              </select>
+              <label class="lb" for="setCooldown">冷却兜底时长（分钟）</label>
+              <input id="setCooldown" type="number" min="1" max="1440" style="margin-bottom:4px">
+              <p class="desc">
+                只在上游<b>没有</b>给出重置时间时使用。上游给了就用上游的
+                （免费模型按自然日，自动算到次日本地零点）。
+                改这个值会清空现有冷却，让新配置立刻生效。
+              </p>
+              <label class="lb" for="setDefaultModel">默认模型</label>
+              <select id="setDefaultModel" style="margin-bottom:4px"></select>
+              <p class="desc">客户端请求里不带 <code>model</code> 字段时用它。</p>
+            </div>
+          </div>
+          <div class="box">
+            <header><h3>system prompt 覆盖</h3></header>
+            <div class="pad">
+              <textarea id="setOverride" rows="7" placeholder="留空 = 用客户端自己的 system 提示"></textarea>
+              <p class="desc" style="margin-top:8px">
+                填了就<b>替换</b>客户端传来的 system 消息（位置不变，内容换成这里填的）。
+                适用于给所有客户端统一注入一段行为约束。
+              </p>
+            </div>
+          </div>
+        </div>
+        <div class="box">
+          <header>
+            <h3>自定义请求头</h3>
+            <span class="grow"></span>
+            <button class="xs ghost" id="btnHdrReset">恢复默认</button>
+          </header>
+          <div class="pad">
+            <p class="desc">
+              上游靠这些头识别「是不是 Cline 客户端」，<b>改动有风险</b>：填错会被 403
+              （<code>only available via Cline product surfaces</code>）。
+              一般只在客户端版本升级、上游要求新版本号时才需要改。留空的行不生效。
+            </p>
+            <div class="hdrgrid" id="hdrGrid"></div>
+          </div>
+        </div>
+        <div class="box">
+          <header><h3>保存</h3></header>
+          <div class="pad">
+            <div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">
+              <button class="primary" id="btnSetSave">保存设置</button>
+              <button class="ghost" id="btnSetReload">放弃改动并重新读取</button>
+              <span class="grow" style="flex:1"></span>
+              <span class="note" id="setNote"></span>
+            </div>
+            <div id="setPersist" style="margin-top:11px"></div>
+          </div>
+        </div>
+      </section>
     </div>
   </div>
 </div>
@@ -961,16 +1241,28 @@ var VIEWS = {
   models:{t:"模型",s:"浏览模型，测延迟与输出速度"},
   usage:{t:"统计",s:"token 用量与重试放大"},
   logs:{t:"日志",s:"固定窗口滚动查看历史请求"},
+  upstreams:{t:"上游渠道",s:"按模型钉住上游渠道、重定向模型 ID"},
+  settings:{t:"设置",s:"轮换策略、冷却时长、请求头与 system 覆盖"},
   config:{t:"接入配置",s:"把服务接到你的客户端"}
 };
 
 var state = {
-  key:"", model:"", models:[], messages:[], chatStats:null,
+  key:"", model:"", messages:[], chatStats:null,
   stream:true, temp:"", topp:"", sys:"",
-  health:null, logs:[], filter:"all", search:"", sort:"region", sortDir:1,
-  testing:false, busy:false, abort:null, snip:"curl",
+  health:null, logs:[], filter:"all",
+  busy:false, abort:null, snip:"curl",
   login:null, loginTimer:null, follow:true, selId:null,
-  healthDown:false   // 上次健康检查是否失败（用于去重连接错误提示）
+  healthDown:false,   // 上次健康检查是否失败（用于去重连接错误提示）
+  hasDetail:false,    // /v1/status 是否读到了账号明细（没配 key 时为 false）
+  upstreams:[], upModels:[], config:null,
+  // 模型库
+  owned:[],           // 已启用模型（/v1/models 真正会返回的那些）
+  ownedBuiltin:false, // 是否处在「没启用过 → 回退内置推荐」的状态
+  mLibGroups:[],      // 推荐分组（面板打开就拉）
+  mCatalog:null,      // 全部模型分组（展开折叠块才拉）
+  mCatalogTotal:0,
+  mCatLoaded:false,
+  mchecks:{}          // 模型可用性检测的内存态（服务端不存，只回答"刚才能不能用"）
 };
 
 function save(k,v){ try{ localStorage.setItem(k, typeof v==="string"?v:JSON.stringify(v)); }catch(e){} }
@@ -1289,6 +1581,10 @@ function showTab(name){
   if(name==="logs") renderLogs();
   if(name==="accounts") renderAccts();
   if(name==="usage") renderUsage();
+  if(name==="upstreams") loadUpstreams();
+  // 模型页：已启用列表 + 推荐分组一起拉（推荐清单只有二十几条，够快）
+  if(name==="models"){ loadModelLibrary(false); loadOwnedModels(); }
+  if(name==="settings") loadSettings();
 }
 
 /* ══ 健康 / 账号池 ══ */
@@ -1297,21 +1593,31 @@ function renderHealth(h){
   var avail=h.accounts_available||0,total=h.account_count||0,det=h.account_details||[];
   var cells=$("poolCells");
   if(!total){ cells.innerHTML='<span class="empty">未配置账号</span>'; }
+  else if(!det.length){
+    // /v1/status 读不到明细（没填 API Key）：不画格子，免得让人以为账号是坏的
+    cells.innerHTML='<span class="empty">'+total+' 个账号（填写 API Key 后显示明细）</span>';
+  }
   else{
     cells.innerHTML=det.map(function(a){
-      var cls="cell "+(a.available?"live":(a.enabled?"cool":"off"))+(a.runtime?" tmp":"");
+      // 冷却已降到「账号×模型」粒度：格子只区分
+      //   可用 / 部分模型冷却 / 全部模型冷却 / 停用
+      var cms=a.cooldown_models||[];
+      // 用「已启用模型数」判断是不是整号冷却：那才是用户实际在用的模型集
+      var known=state.owned.length;
+      var allCooling=cms.length&&known&&cms.length>=known;
+      var cls="cell "+(a.enabled?(cms.length?(allCooling?"cool":"part"):"live"):"off")+(a.runtime?" tmp":"");
       var tip="账号 #"+(a.index+1);
       if(a.email) tip+="（"+a.email+"）";
-      tip+="：" +(!a.enabled?"已停用":(a.available?"可用":"冷却中"));
-      if(a.enabled&&!a.available&&a.cooldown_seconds){
-        tip+="，剩约 "+fmtDur(a.cooldown_seconds);
-        if(a.cooldown_reason==="limit") tip+="（额度用尽）";
-        else if(a.cooldown_reason==="empty") tip+="（空响应）";
-        else if(a.cooldown_reason==="auth") tip+="（鉴权失败）";
+      tip+="：" +(!a.enabled?"已停用":(cms.length?(allCooling?"全部模型冷却中":"部分模型冷却中"):"可用"));
+      if(a.enabled&&cms.length){
+        tip+="，共 "+cms.length+" 个模型受限，最长剩约 "+fmtDur(a.cooldown_seconds);
+        var lim=null;
+        for(var i=0;i<cms.length;i++){ if(cms[i].limited){ lim=cms[i]; break; } }
+        tip+="（"+coolLabel((lim||cms[0]).kind)+"）";
       }
-      if(a.runtime) tip+="，登录得到（重启会丢）";
+      if(a.runtime) tip+="，控制台登录（本地会自动存盘）";
       else if(a.token_cached) tip+="，token 已缓存";
-      var lb=!a.enabled?"–":(a.available?String(a.index+1):(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!"));
+      var lb=!a.enabled?"–":(cms.length?(a.cooldown_seconds?Math.ceil(a.cooldown_seconds/60)+"m":"!"):String(a.index+1));
       return '<span class="'+cls+'" title="'+esc(tip)+'">'+esc(lb)+"</span>";
     }).join("");
   }
@@ -1396,6 +1702,11 @@ function goConfig(){ showTab("config"); $("key").focus(); }
 function goAccounts(){ showTab("accounts"); }
 
 function loadHealth(){
+  // 两个端点各司其职：
+  //   /v1/health 免鉴权、字段精简（只回答「服务在不在」）→ 用来判断连通性；
+  //   /v1/status 需要 API_KEY、带账号明细与冷却表 → 用来渲染账号池。
+  // 分开的原因：health 面向公网暴露（部署到云端时任何人都能读），账号邮箱
+  // 与用量不该出现在那里。
   return fetch("/v1/health",{cache:"no-store"})
     .then(function(r){
       if(!r.ok) throw new Error("服务返回 HTTP "+r.status);
@@ -1403,7 +1714,29 @@ function loadHealth(){
     })
     .then(function(h){
       if(state.healthDown){ state.healthDown=false; toast("ok","服务已恢复","已重新连上本地服务。"); }
+      // 先用手上的公共字段渲染一次（首屏与鉴权失败时的降级视图）
       renderHealth(h);
+      // 再拉带明细的完整状态；没配 key 或鉴权失败时保持上面的精简视图
+      return fetch("/v1/status",{cache:"no-store",headers:authHeaders()})
+        .then(function(r){ return r.ok?r.json():null; })
+        .catch(function(){ return null; })
+        .then(function(s){
+          if(s&&s.ok){
+            h.account_details=s.account_details||[];
+            h.account_count=s.account_count||0;
+            h.accounts_available=s.accounts_available||0;
+            h.runtime_accounts=s.runtime_accounts||0;
+            h.cooldowns=s.cooldowns||[];
+            h.cooldown_minutes=s.cooldown_minutes;
+            h.strategy=s.strategy;
+            h.default_model=s.default_model;
+            h.persisted=s.persisted;
+            state.hasDetail=true;
+          } else {
+            state.hasDetail=false;
+          }
+          renderHealth(h);
+        });
     })
     .catch(function(e){
       $("keySq").className="sq bad";
@@ -1431,10 +1764,15 @@ function diagHint(){
 /* ══ 账号页 ══ */
 
 // 冷却原因 → 中文说明。抽出来是因为卡片和概览都要用。
+// 冷却种类 → 中文标签。kind 来自上游 429 响应体的解析（见 worker.js parseLimitInfo）。
+// 注意 unknown 是「我们按配置时长猜的」，界面上要说成「未识别」而不是假装知道原因。
 function coolLabel(reason){
-  if(reason==="limit") return "额度用尽";
+  if(reason==="limit"||reason==="free_daily") return "免费日额度";
+  if(reason==="pass_limit") return "订阅额度";
+  if(reason==="spend_limit") return "花费上限";
   if(reason==="empty") return "空响应";
   if(reason==="auth") return "鉴权失败";
+  if(reason==="unknown") return "未识别";
   return "冷却中";
 }
 // 秒 → 人类可读的剩余时间
@@ -1459,18 +1797,35 @@ function fmtAgo(ts){
 /* 一个账号的卡片。
    布局：头部（序号+邮箱+来源+状态徽标）→ 数据格 → 最后错误行 → 动作排。 */
 function acctCard(a){
-  var st = !a.enabled ? "off" : (a.available ? "live" : "cool");
+  // 冷却改成「账号×模型」级后，「可用」只表示账号本身参与调度；
+  // 具体哪个模型受限看 cooldown_models。卡片状态因此分三档：
+  //   停用 / 全部模型都在冷却（真正不可用）/ 部分模型冷却（还能用别的模型）
+  var cms = a.cooldown_models || [];
+  var allCooling = false;
+  if(a.enabled && cms.length){
+    var known = state.owned.length;
+    // 模型总数未知时（health 降级视图）不轻易判定「全部冷却」
+    allCooling = known > 0 && cms.length >= known;
+  }
+  var st = !a.enabled ? "off" : (cms.length ? (allCooling ? "cool" : "warn") : "live");
   var badge = !a.enabled
     ? '<span class="badge off">已停用</span>'
-    : (a.available ? '<span class="badge live">可用</span>'
-                   : '<span class="badge cool">冷却中</span>');
+    : (cms.length
+        ? (allCooling ? '<span class="badge cool">冷却中</span>' : '<span class="badge part">部分冷却</span>')
+        : '<span class="badge live">可用</span>');
 
-  // 冷却：只在真的冷却时显示剩余时间；可用账号显示 token 缓存状态更有用
-  var coolV, coolCls;
-  if(!a.enabled){ coolV="—"; coolCls="dim"; }
-  else if(a.available){ coolV="无"; coolCls="dim"; }
-  else { coolV=fmtDur(a.cooldown_seconds); coolCls="warn"; }
-  var coolK = (!a.enabled||a.available) ? "冷却" : "冷却（"+coolLabel(a.cooldown_reason)+"）";
+  // 冷却列显示最长的那个剩余时间（多模型冷却时数字旁边标出数量）
+  var coolV, coolCls, coolK;
+  if(!a.enabled){ coolV="—"; coolCls="dim"; coolK="冷却"; }
+  else if(!cms.length){ coolV="无"; coolCls="dim"; coolK="冷却"; }
+  else {
+    coolV = fmtDur(a.cooldown_seconds)+(cms.length>1?" · "+cms.length+" 个模型":"");
+    coolCls="warn";
+    // 原因取最明确的那条：额度用尽比「未知」值得说
+    var lim = null;
+    for(var i=0;i<cms.length;i++){ if(cms[i].limited){ lim=cms[i]; break; } }
+    coolK = "冷却（"+coolLabel((lim||cms[0]).kind)+"）";
+  }
 
   var s = a.stats || {};
   // 成功率：只在有调用记录时显示，否则显示 "—"（避免 0% 的误导）
@@ -1497,7 +1852,7 @@ function acctCard(a){
       '<span class="ix">'+(a.index+1)+'</span>'+
       '<span class="who">'+
         '<span class="ml" title="'+esc(email)+'">'+esc(email)+'</span>'+
-        '<span class="src">'+(a.runtime?'<b>临时</b>· 登录得到':'环境变量')+'</span>'+
+        '<span class="src">'+(a.runtime?'<b>已存盘</b> · 控制台登录':'环境变量')+'</span>'+
       '</span>'+
       badge+
     '</div>'+
@@ -1513,10 +1868,12 @@ function acctCard(a){
     '</div>'+
     lastRow+
     '<div class="act">'+
+      '<button class="xs" data-detail="'+esc(a.id)+'" title="查看该账号的模型级冷却、可用模型与 token 用量">详情</button>'+
+      '<button class="xs" data-balance="'+esc(a.id)+'" title="查询该账号的官方 Credit 余额">余额</button>'+
       (a.enabled
         ? '<button class="xs" data-act="disable" data-id="'+esc(a.id)+'" title="停止参与轮询（可用时仍保留在池里）">停用</button>'
         : '<button class="xs" data-act="enable" data-id="'+esc(a.id)+'" title="重新参与轮询">启用</button>')+
-      '<button class="xs" data-act="reset" data-id="'+esc(a.id)+'" title="清除冷却与 token 缓存">重置冷却</button>'+
+      '<button class="xs" data-act="reset" data-id="'+esc(a.id)+'" title="清除该账号所有模型的冷却与 token 缓存">重置冷却</button>'+
       removeBtn+
     '</div>'+
   '</div>';
@@ -1525,19 +1882,26 @@ function acctCard(a){
 function renderAccts(){
   var det=(state.health&&state.health.account_details)||[];
   var g=$("accts");
-  var avail=det.filter(function(a){return a.available;}).length;
+  // 冷却改为「账号×模型」级后，计数口径要跟着改：
+  //   可用   = 启用且没有任何模型在冷却
+  //   冷却中 = 启用、但有模型在冷却（是否「全部」不影响计数，卡片上会区分）
+  var avail=det.filter(function(a){return a.enabled&&!(a.cooldown_models||[]).length;}).length;
   var off=det.filter(function(a){return !a.enabled;}).length;
-  var cool=det.filter(function(a){return a.enabled&&!a.available;}).length;
+  var cool=det.filter(function(a){return a.enabled&&(a.cooldown_models||[]).length>0;}).length;
 
   $("acOk").textContent=avail; $("acCool").textContent=cool;
   $("acOff").textContent=off;  $("acTotal").textContent=det.length;
 
   // 概览右侧一句话：把最该采取行动的情况说清楚
   var hint="";
-  if(det.length&&avail===0){
+  if(!state.hasDetail){
+    hint='<span style="color:var(--warn)">读不到账号明细：请在下方填入 API Key（「接入配置」页可复制）</span>';
+  } else if(det.length&&avail===0&&cool===0){
     hint = off===det.length
       ? '<span style="color:var(--bad)">全部账号已停用，请求会直接失败</span>'
       : '<span style="color:var(--warn)">当前没有可用账号，请求会返回 429</span>';
+  } else if(cool>0&&avail===0){
+    hint='<span style="color:var(--warn)">所有账号都有模型在冷却；额度按「账号×模型」独立计算，等恢复或加号</span>';
   } else if(off>0){
     hint='<span style="color:var(--ink-3)">'+off+' 个账号已停用，不参与轮询</span>';
   } else if(det.length){
@@ -1551,13 +1915,15 @@ function renderAccts(){
 }
 
 /* 账号控制：把动作发给服务端，用返回的最新账号列表直接刷新界面，
-   省掉一次 /v1/health 往返。 */
-function accountAction(action,id,btn){
+   省掉一次 /v1/health 往返。
+   modelId 只在 clearCooldown（解除单个「账号×模型」冷却）时使用。 */
+function accountAction(action,id,btn,modelId){
   var busyLabel = {disable:"停用中",enable:"启用中",reset:"重置中",remove:"移除中",
-                   enableAll:"启用中",resetAll:"重置中"}[action] || "处理中";
+                   enableAll:"启用中",resetAll:"重置中",clearCooldown:"解除中"}[action] || "处理中";
   if(btn){ btn.disabled=true; flash(btn,busyLabel); }
   var payload={action:action};
   if(id) payload.id=id;
+  if(modelId) payload.modelId=modelId;
 
   return fetch("/v1/accounts/action",{method:"POST",headers:authHeaders(),body:JSON.stringify(payload)})
     .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
@@ -1570,11 +1936,15 @@ function accountAction(action,id,btn){
         return;
       }
       // 用返回的账号列表就地更新，页面立刻反映新状态
-      if(state.health) state.health.account_details=o.d.accounts;
-      if(state.health) state.health.account_count=o.d.accounts.length;
+      if(state.health){
+        state.health.account_details=o.d.accounts;
+        state.health.account_count=o.d.accounts.length;
+      }
       recalcHealthCounts();
       renderAccts(); renderHealth(state.health);
       if(o.d.message) toast("ok","已完成", esc(o.d.message));
+      // 详情弹窗里点的「解除冷却」：列表已刷新，把弹窗内容也更新掉
+      if(action==="clearCooldown"&&$("acctModal")&&!$("acctModal").hidden) openAcctDetail(id);
     })
     .catch(function(e){ if(btn) btn.disabled=false; toastError("账号操作请求失败", e); });
 }
@@ -1584,8 +1954,134 @@ function recalcHealthCounts(){
   var h=state.health; if(!h||!h.account_details) return;
   h.account_count=h.account_details.length;
   h.accounts=h.account_count;
-  h.accounts_available=h.account_details.filter(function(a){return a.available;}).length;
+  h.accounts_available=h.account_details.filter(function(a){
+    return a.enabled&&!(a.cooldown_models||[]).length;
+  }).length;
   h.runtime_accounts=h.account_details.filter(function(a){return a.runtime;}).length;
+}
+
+/* ── 账号详情 / 余额 ──
+   详情回答的是「这个账号现在哪些模型到了上限、什么时候恢复、还有哪些模型能用」——
+   额度的粒度就是「账号×模型」，所以视图要对齐这个粒度，而不是只给一个总数。 */
+function openAcctDetail(id){
+  var box="acctModal";
+  var el=$(box);
+  if(!el){
+    var d=document.createElement("div");
+    d.className="modal-bg"; d.id=box;
+    d.innerHTML='<div class="modal"><header><h3 id="acctModalTtl">账号详情</h3>'+
+      '<span class="grow"></span><button class="xs ghost" id="acctModalClose">关闭</button></header>'+
+      '<div class="pad" id="acctModalBody"></div></div>';
+    document.body.appendChild(d);
+    $("acctModalClose").addEventListener("click",function(){ $("acctModal").hidden=true; });
+    d.addEventListener("click",function(e){ if(e.target===d) d.hidden=true; });
+  }
+  el.hidden=false;
+  $("acctModalBody").innerHTML='<div class="num" style="color:var(--ink-3)">读取中…</div>';
+  fetch("/v1/accounts/detail?id="+encodeURIComponent(id),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("acctModalBody").innerHTML='<div class="err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+'</div>';
+        return;
+      }
+      renderAcctDetail(o.d);
+    })
+    .catch(function(e){
+      $("acctModalBody").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+'</div>';
+    });
+}
+
+function renderAcctDetail(d){
+  $("acctModalTtl").textContent="账号详情 · "+(d.email||d.id.slice(0,6));
+  var lim=d.limited||[];
+  var limRows = lim.length
+    ? lim.map(function(c){
+        return '<tr><td class="mid">'+esc(c.model_id)+'</td>'+
+          '<td>'+esc(coolLabel(c.kind))+'</td>'+
+          '<td class="num">'+esc(fmtDur(c.remaining_seconds))+'</td>'+
+          '<td class="num">'+esc(c.resets_at?fmtClock(new Date(c.resets_at).getTime()):"—")+'</td>'+
+          '<td class="acts"><button class="xs" data-clear="'+esc(d.id)+'" data-model="'+esc(c.model_id)+'">解除冷却</button></td></tr>';
+      }).join("")
+    : '<tr><td colspan="5" class="dim" style="padding:11px">没有模型在冷却中。</td></tr>';
+
+  var others=(d.other_models||[]);
+  var otherHtml = others.length
+    ? others.slice(0,60).map(function(m){ return '<code class="chiplite">'+esc(m)+'</code>'; }).join(" ")
+      + (others.length>60?' <span class="dim">…共 '+others.length+' 个</span>':'')
+    : '<span class="dim">没有其它可用模型。</span>';
+
+  var ut=d.usage_total||{}, ud=d.usage_today||{};
+  $("acctModalBody").innerHTML=
+    '<div class="kv2">'+
+      '<div><span class="k">状态</span><span class="v">'+esc(d.enabled?"启用":"已停用")+'</span></div>'+
+      '<div><span class="k">来源</span><span class="v">'+esc(d.runtime?"控制台登录（已存盘）":"环境变量")+'</span></div>'+
+      '<div><span class="k">token 缓存</span><span class="v">'+esc(d.token_cached?"有":"无")+'</span></div>'+
+      '<div><span class="k">兜底冷却时长</span><span class="v">'+esc(d.cooldown_minutes+" 分钟")+'</span></div>'+
+    '</div>'+
+    '<h4 class="mh">冷却中的模型（额度按「账号×模型」独立计算）</h4>'+
+    '<div class="tblwrap tblfixed"><table class="m"><thead><tr><th>模型</th><th>原因</th><th>剩余</th><th>恢复时刻</th><th></th></tr></thead>'+
+    '<tbody>'+limRows+'</tbody></table></div>'+
+    '<h4 class="mh">现在可用的模型（'+others.length+'）</h4>'+
+    '<div class="chips">'+otherHtml+'</div>'+
+    '<h4 class="mh">Token 用量（累计 / 今日）</h4>'+
+    '<div class="kv2">'+
+      '<div><span class="k">输入</span><span class="v">'+esc(fmtTok(ut.input)+" / "+fmtTok(ud.input))+'</span></div>'+
+      '<div><span class="k">输出</span><span class="v">'+esc(fmtTok(ut.output)+" / "+fmtTok(ud.output))+'</span></div>'+
+      '<div><span class="k">合计</span><span class="v">'+esc(fmtTok(ut.total)+" / "+fmtTok(ud.total))+'</span></div>'+
+      '<div><span class="k">上游调用</span><span class="v">'+esc(String(ut.calls||0)+" / "+String(ud.calls||0))+'</span></div>'+
+    '</div>'+
+    '<h4 class="mh">refreshToken</h4>'+
+    '<p class="desc">'+
+      (d.rotated
+        ? "<b>该账号的 token 已被上游轮换过</b>（内存里是新值）。环境变量账号的新值无法自动写回，请复制下面这份更新配置；控制台登录的账号已自动落盘。"
+        : "默认只显示脱敏值。需要换机器部署或手工备份时点「显示」取完整值。")+'</p>'+
+    '<div class="snip" id="rtBox" style="margin:0 0 9px">'+esc(d.refresh_token||d.refresh_token_masked||"")+'</div>'+
+    '<div style="display:flex;gap:8px;flex-wrap:wrap">'+
+      '<button class="primary" id="btnRtReveal">显示完整值</button>'+
+      '<button class="ghost" id="btnRtCopy">复制</button>'+
+      '<button class="ghost" id="btnBal">查询官方余额</button>'+
+    '</div>'+
+    '<div id="balBox" style="margin-top:11px"></div>';
+
+  var rtFull=d.refresh_token||"";
+  $("btnRtReveal").addEventListener("click",function(){
+    fetch("/v1/accounts/detail?id="+encodeURIComponent(d.id)+"&reveal=1",{headers:authHeaders(),cache:"no-store"})
+      .then(function(r){ return r.json(); })
+      .then(function(o){
+        if(!o.ok){ toastError("读取完整 token 失败",o); return; }
+        rtFull=o.refresh_token||"";
+        $("rtBox").textContent=rtFull;
+        flash($("btnRtReveal"),"已显示");
+      })
+      .catch(function(e){ toastError("读取完整 token 失败",e); });
+  });
+  $("btnRtCopy").addEventListener("click",function(){ copyText(rtFull||$("rtBox").textContent,$("btnRtCopy"),$("rtBox")); });
+  $("btnBal").addEventListener("click",function(){ queryBalance(d.id,$("btnBal"),$("balBox")); });
+}
+
+function queryBalance(id,btn,box){
+  if(btn){ btn.disabled=true; flash(btn,"查询中"); }
+  fetch("/v1/accounts/balance?id="+encodeURIComponent(id),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn){ btn.disabled=false; btn.textContent="查询官方余额"; }
+      if(!o.d.ok){
+        box.innerHTML='<div class="err">'+esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+'</div>';
+        return;
+      }
+      box.innerHTML='<div class="kv2">'+
+        '<div><span class="k">Credit 余额</span><span class="v ok">'+esc(fmtNum(o.d.balance,6))+'</span></div>'+
+        '<div><span class="k">查询时刻</span><span class="v">'+esc(fmtClock(o.d.checkedAt))+'</span></div>'+
+      '</div>'+
+      '<p class="desc" style="font-size:10.5px;color:var(--ink-3);margin-top:7px">'+
+        '官方接口的原始值以微单位计，这里已按 ÷1e6 换算成面板上显示的 Credit。</p>';
+    })
+    .catch(function(e){
+      if(btn){ btn.disabled=false; btn.textContent="查询官方余额"; }
+      box.innerHTML='<div class="err">'+esc(String(e&&e.message||e))+'</div>';
+    });
 }
 
 /* ── 登录 ── */
@@ -1712,120 +2208,381 @@ function costPill(m){
   if(m.cost==="paid") return '<span class="tag paid">付费</span>';
   return '<span class="tag ov">未标价</span>';
 }
-function loadModels(){
-  var saved=load(LS.tests,{})||{};
-  return fetch("/v1/models",{cache:"no-store"})
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      state.models=(d.data||[]).map(function(m){
-        return { id:m.id, cost:m.cost, free:m.free, channel:m.channel, label:m.label, test:state.testingIds&&state.testingIds[m.id]||saved[m.id]||null };
-      });
-    })
-    .catch(function(){ state.models=[]; })
-    .then(function(){
-      $("cnt-model").textContent=state.models.length?String(state.models.length):"";
-      var sel=$("model");
-      if(!state.models.length){
-        sel.innerHTML='<option value="">模型列表拉取失败</option>';
-        $("mRows").innerHTML=""; $("mEmpty").hidden=false; $("mEmpty").textContent="模型列表拉取失败，点「重新拉取」重试。";
-        renderMStats(); return;
+/* ══ 模型库 ══
+   三段式：可用模型分组（推荐清单）/ 全部模型（折叠，按需抓）/ 已启用模型。
+   三处的卡片共用 modelCardHTML，保证格式与交互完全一致。
+
+   注意：本文件会被 build-console.mjs 注入 worker.js 的模板字符串，
+   反引号与 ${ 会被转义而失效 —— 只能用字符串拼接。 */
+
+// 已启用模型的 ID 集合（判断卡片是否已添加、决定 ＋ 是否可点）
+function ownedSet(){
+  var s={}; for(var i=0;i<state.owned.length;i++) s[state.owned[i].id]=true; return s;
+}
+
+// 模型卡片的「检测」状态：跑着的、跑完的，都从内存里取（服务端不存检测结果，
+// 因为它只回答"刚才那一刻能不能用"，存下来反而会被误当成长期结论）
+function checkState(id){
+  var c=state.mchecks[id];
+  if(!c) return { cls:"", text:"", btn:"检测" };
+  if(c.status==="running") return { cls:"", text:"检测中…", btn:"检测中" };
+  if(c.status==="failed") return { cls:"bad", text:c.error||"检测失败", btn:"重测" };
+  var r=c.result||{};
+  return { cls:r.ok?"ok":"bad", text:r.text||"", btn:"重测" };
+}
+
+// 一张模型卡片。installed=true 时高亮并显示 ✓。
+function modelCardHTML(m, installed){
+  var has=!!installed[m.id];
+  var ck=checkState(m.id);
+  var tags=(m.tags||[]).filter(function(t){return t;}).map(function(t){
+    return '<span class="mtag">'+esc(t)+"</span>";
+  }).join("");
+  var name=m.name||m.id;
+  var ctx=m.context_length?'<span class="mctx" title="上下文长度">'+fmtCtx(m.context_length)+"</span>":"";
+  // 标题提示：把 ID、描述、下一步动作都放进去，卡片本身不用铺满这些信息
+  var tip=[name,m.id,m.description,"",has?"已启用 · 点 ⧉ 复制 ID":"点 ＋ 添加"].filter(function(x){return x;}).join("\n");
+  return '<div class="mcard'+(has?" on":"")+'" data-mid="'+esc(m.id)+'" data-on="'+(has?"1":"0")+'" title="'+esc(tip)+'">'+
+    '<div class="mrow">'+
+      '<span class="mname">'+esc(name)+"</span>"+
+      (m.id&&m.id!==name?'<span class="mid">'+esc(m.id)+"</span>":"")+
+      ctx+tags+
+    "</div>"+
+    // 按钮单独一行（见 CSS 里关于折行的说明）
+    '<div class="macts">'+
+      '<button class="xs ghost" data-check="'+esc(m.id)+'"'+(ck.btn==="检测中"?" disabled":"")+">"+esc(ck.btn)+"</button>"+
+      '<button class="xs primary" data-add="'+esc(m.id)+'" title="添加此模型"'+(has?" disabled":"")+">＋ 添加</button>"+
+      '<button class="xs ghost" data-copyid="'+esc(m.id)+'" title="复制模型 ID">⧉ 复制</button>'+
+    "</div>"+
+    (ck.text?'<div class="mchk '+ck.cls+'">'+esc(ck.text)+"</div>":"")+
+    (m.description?'<div class="mdesc">'+esc(m.description)+"</div>":"")+
+  "</div>";
+}
+
+// 一组模型（分组标题 + 整组添加 + 卡片墙）
+function modelGroupHTML(g, installed){
+  var models=g.models||[];
+  var meta=g.meta||{};
+  var pending=models.filter(function(m){return !installed[m.id];}).length;
+  var addAll = pending
+    ? '<button class="xs primary" data-addgroup="'+esc(g.key)+'">全部添加 ('+pending+")</button>"
+    : '<button class="xs ghost" disabled>已全部添加</button>';
+  return '<div class="mgroup" data-gkey="'+esc(g.key)+'">'+
+    '<div class="mghead">'+
+      '<span class="gdot" style="background:'+(meta.color||"var(--ink-3)")+'"></span>'+
+      "<h4>"+esc(meta.title||g.key)+"</h4>"+
+      (meta.sub?'<span class="gsub">（'+esc(meta.sub)+"）</span>":"")+
+      '<span class="note">共 '+models.length+" 个"+(pending?" · 待添加 "+pending:" · 已全部添加")+"</span>"+
+      '<span class="grow"></span>'+
+      addAll+
+    "</div>"+
+    '<div class="mcards">'+models.map(function(m){ return modelCardHTML(m,installed); }).join("")+"</div>"+
+  "</div>";
+}
+
+// 上下文长度按 K 显示：500000 → 500K（比 500,000 好读，也和模型页的惯例一致）
+function fmtCtx(n){
+  n=Number(n)||0;
+  if(!n) return "";
+  if(n>=1000000) return (n/1000000).toFixed(n%1000000?1:0)+"M";
+  if(n>=1000) return Math.round(n/1000)+"K";
+  return String(n);
+}
+
+// 拉推荐分组（面板打开时调；force 用于「刷新数据」）
+function loadModelLibrary(force){
+  var btn=$("mRefreshBtn");
+  if(force&&btn){ btn.disabled=true; flash(btn,"刷新中"); }
+  $("mLibrary").innerHTML='<div class="empty">'+(force?"正在重新抓取上游…":"加载中…")+"</div>";
+  return fetch("/v1/models/library"+(force?"?refresh=1":""),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){
+        $("mLibrary").innerHTML='<div class="err"><b>加载失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+
+          '<br>请先在「接入配置」页填入 API Key。</div>';
+        $("mLibNote").textContent="";
+        return;
       }
-      var ids=state.models.map(function(m){return m.id;});
-      sel.innerHTML=ids.map(function(id){ return '<option value="'+esc(id)+'"'+(id===state.model?" selected":"")+">"+esc(id)+"</option>"; }).join("");
-      if(ids.indexOf(state.model)<0){ state.model=ids[0]; sel.value=state.model; save(LS.model,state.model); }
-      renderMRows(); renderMStats();
+      state.mLibGroups=o.d.groups||[];
+      renderModelLibrary();
+      // 折叠区的「已添加」标记也依赖已启用列表，一并刷新免得两处互相矛盾
+      if(state.mCatLoaded) renderModelCatalog();
+      if(o.d.stale&&o.d.error){
+        toast("warn","上游抓取失败，显示上次缓存", esc(o.d.error));
+      } else if(force){
+        toast("ok","模型数据已刷新","");
+      }
+    })
+    .catch(function(e){
+      if(btn) btn.disabled=false;
+      $("mLibrary").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
     });
 }
-function visibleModels(){
-  var q=$("mfilter").value.trim().toLowerCase();
-  var freeOnly=$("mfree").checked, cnOnly=$("mcn").checked;
-  var list=state.models.filter(function(m){
-    if(freeOnly&&!isFree(m)) return false;
-    if(cnOnly&&regionOf(m.id)!=="cn") return false;
-    if(q&&m.id.toLowerCase().indexOf(q)<0&&regionName(m.id).toLowerCase().indexOf(q)<0) return false;
-    return true;
-  });
-  var s=state.sort, dir=state.sortDir;
-  list.sort(function(a,b){
-    var r;
-    // 地区排序：国产始终优先（无论升降序都先给国产，第二段才按 id）
-    if(s==="region"){
-      var ra=regionOf(a.id)==="cn"?0:1, rb=regionOf(b.id)==="cn"?0:1;
-      if(ra!==rb) return ra-rb;
-      r = a.id<b.id?-1:a.id>b.id?1:0;
-      return r*dir;
-    }
-    if(s==="speed"){
-      var av=typeof a.test?.tps==="number"?a.test.tps:-1, bv=typeof b.test?.tps==="number"?b.test.tps:-1;
-      if(av!==bv) return (av-bv)*dir;
-    } else if(s==="ttft"){
-      var at=a.test&&a.test.ttft!=null?a.test.ttft:Infinity, bt=b.test&&b.test.ttft!=null?b.test.ttft:Infinity;
-      if(at!==bt) return (at-bt)*dir;
-    }
-    r = a.id<b.id?-1:a.id>b.id?1:0;
-    return r*dir;
-  });
-  return list;
+
+function renderModelLibrary(){
+  var groups=state.mLibGroups||[];
+  var inst=ownedSet();
+  if(!groups.length){
+    $("mLibrary").innerHTML='<div class="empty">暂无数据，点右上角「刷新数据」。</div>';
+    $("mLibNote").textContent="";
+    return;
+  }
+  $("mLibrary").innerHTML=groups.map(function(g){ return modelGroupHTML(g,inst); }).join("");
+  var total=groups.reduce(function(n,g){ return n+(g.models||[]).length; },0);
+  $("mLibNote").textContent="共 "+total+" 个 · 已启用 "+state.owned.length+" 个";
 }
-function renderMRows(){
-  var list=visibleModels(), maxTps=0;
-  for(var k=0;k<state.models.length;k++){ var t=state.models[k].test; if(t&&t.tps>maxTps) maxTps=t.tps; }
-  $("mRows").innerHTML=list.map(function(m){
-    var t=m.test, spd, ttft, isCn=regionOf(m.id)==="cn";
-    if(!t){
-      spd='<div class="spd"><span class="n na">未测试</span><span class="h na" style="width:0"></span></div>';
-      ttft='<span class="num" style="color:var(--ink-3)">-</span>';
-    } else if(t.ok){
-      var pct=maxTps>0&&t.tps?Math.max(3,Math.round(t.tps/maxTps*100)):0;
-      spd='<div class="spd"><span class="n">'+fmtNum(t.tps,1)+' tok/s</span><span class="h" style="width:'+pct+'%"></span></div>';
-      ttft='<span class="num">'+fmtMs(t.ttft)+"</span>";
-    } else {
-      spd='<div class="spd"><span class="n" style="color:var(--bad)">失败</span><span class="h" style="width:0;background:var(--bad)"></span></div>';
-      ttft='<span class="num" style="color:var(--ink-3)">-</span>';
-    }
-    var btn='<button class="xs ghost" data-test="'+esc(m.id)+'">'+(t&&t.busy?"测试中":t?"重测":"测试")+"</button>";
-    var title="";
-    if(t&&t.at){ var mi=Math.round((Date.now()-t.at)/60000); title=' title="上次测量：'+(mi<1?"刚刚":mi+" 分钟前")+'"'; }
-    var regTag = isCn ? '<span class="tag cn">'+esc(regionName(m.id))+"</span>"
-                      : (regionOf(m.id)==="of" ? '<span class="tag free">官方</span>' : '<span class="tag ov">'+esc(regionName(m.id))+"</span>");
-    return '<tr class="'+(isCn?"cn":"")+'">'+
-      "<td>"+regTag+"</td>"+
-      '<td class="mid">'+esc(m.id)+"</td>"+
-      "<td>"+costPill(m)+"</td>"+
-      "<td"+title+">"+spd+"</td>"+
-      "<td>"+ttft+"</td>"+
-      '<td class="acts">'+btn+" "+
-        '<button class="xs ghost" data-copyid="'+esc(m.id)+'">复制 ID</button> '+
-        '<button class="xs ghost" data-use="'+esc(m.id)+'">用于对话</button></td></tr>';
+
+// 全部模型：只在用户展开时抓一次（上游 440+ 条、约 500 KB）
+function loadModelCatalog(force){
+  state.mCatLoaded=true;
+  $("mCatalog").innerHTML='<div class="empty">正在抓取全部模型…（上游约 500 KB，首次会慢几秒）</div>';
+  return fetch("/v1/models/catalog"+(force?"?refresh=1":""),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("mCatalog").innerHTML='<div class="err"><b>加载失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+"</div>";
+        return;
+      }
+      state.mCatalog=o.d.groups||[];
+      state.mCatalogTotal=o.d.total||0;
+      renderModelCatalog();
+    })
+    .catch(function(e){
+      $("mCatalog").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
+    });
+}
+
+// 搜索只过滤本地已有数据，不发请求（只过一遍 400+ 条，没必要加防抖）
+function filterCatalog(groups,q){
+  q=String(q||"").trim().toLowerCase();
+  if(!q) return groups;
+  var out=[];
+  for(var i=0;i<groups.length;i++){
+    var hit=groups[i].models.filter(function(m){
+      return String(m.name||"").toLowerCase().indexOf(q)>=0||String(m.id||"").toLowerCase().indexOf(q)>=0;
+    });
+    if(hit.length) out.push({key:groups[i].key,models:hit});
+  }
+  return out;
+}
+
+function renderModelCatalog(){
+  var groups=state.mCatalog||[];
+  if(!groups.length){ $("mCatalog").innerHTML='<div class="empty">暂无数据</div>'; return; }
+  var q=$("mCatSearch").value;
+  // 搜索时重新按供应商分组：过滤后空掉的组不该留一个空壳标题
+  var shown=q?filterCatalog(groups,q):groups;
+  var inst=ownedSet();
+  var matched=shown.reduce(function(n,g){ return n+(g.models||[]).length; },0);
+  $("mCatCount").textContent=q
+    ? ("匹配 "+matched+" 个 / 共 "+state.mCatalogTotal+" 个")
+    : (state.mCatalogTotal+" 个模型 · "+groups.length+" 个供应商");
+  if(!shown.length){
+    $("mCatalog").innerHTML='<div class="empty">没有匹配「'+esc(q)+'」的模型。</div>';
+    return;
+  }
+  $("mCatalog").innerHTML=shown.map(function(g){ return modelGroupHTML(g,inst); }).join("");
+}
+
+// 已启用模型：这是 /v1/models 真正会返回的内容
+function loadOwnedModels(){
+  return fetch("/v1/models/enabled",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("mOwned").innerHTML='<div class="err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+"</div>";
+        return;
+      }
+      state.owned=o.d.models||[];
+      state.ownedBuiltin=!!o.d.using_builtin;
+      renderOwnedModels();
+    })
+    .catch(function(e){
+      $("mOwned").innerHTML='<div class="err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+"</div>";
+    });
+}
+
+function renderOwnedModels(){
+  var list=state.owned||[];
+  var cnt=$("cnt-model"); if(cnt) cnt.textContent=list.length?String(list.length):"";
+  $("mOwnNote").textContent=list.length?("共 "+list.length+" 个"):"";
+
+  // 一个都没启用时服务端回退到内置推荐 —— 必须明确说出来，否则用户会以为
+  // 列表里的四个模型是他自己加过的
+  var hint=$("mOwnHint");
+  if(state.ownedBuiltin){
+    hint.innerHTML='<b>还没有手动启用过模型</b>，所以 <code>/v1/models</code> 暂时回退到'
+      +'内置推荐（下面这几个）。从上面任一分组里添加模型后，就以你的选择为准。';
+  } else {
+    hint.innerHTML='只有这里的模型会出现在 <code>/v1/models</code> 里。点「移除」即可撤下。';
+  }
+
+  if(!list.length){ $("mOwned").innerHTML='<div class="empty">还没有模型。</div>'; return; }
+  $("mOwned").innerHTML='<div class="mcards">'+list.map(function(m){
+    var badge=m.is_default?'<span class="badge live">默认</span>':"";
+    var ck=checkState(m.id);
+    return '<div class="mcard on'+(m.is_default?" def":"")+'" data-mid="'+esc(m.id)+'">'+
+      '<div class="mrow">'+
+        '<span class="mname">'+esc(m.name||m.id)+"</span>"+
+        (m.name&&m.name!==m.id?'<span class="mid">'+esc(m.id)+"</span>":"")+
+        (m.context_length?'<span class="mctx">'+fmtCtx(m.context_length)+"</span>":"")+
+        badge+
+      "</div>"+
+      '<div class="macts">'+
+        // 检测按钮在已启用卡片上同样需要：加之前能用不代表现在还能用，
+        // 而"这个模型到底还行不行"正是这一页最常见的诉求
+        '<button class="xs ghost" data-check="'+esc(m.id)+'"'+(ck.btn==="检测中"?" disabled":"")+">"+esc(ck.btn)+"</button>"+
+        (m.is_default?"":'<button class="xs ghost" data-setdefault="'+esc(m.id)+'" title="不带 model 的请求默认用它">设为默认</button>')+
+        '<button class="xs ghost" data-copyid="'+esc(m.id)+'" title="复制模型 ID">⧉ 复制</button>'+
+        '<button class="xs danger" data-rm="'+esc(m.id)+'" title="从 /v1/models 里撤下">移除</button>'+
+      "</div>"+
+      (ck.text?'<div class="mchk '+ck.cls+'">'+esc(ck.text)+"</div>":"")+
+      (m.description?'<div class="mdesc">'+esc(m.description)+"</div>":"")+
+    "</div>";
   }).join("");
-  var emp=$("mEmpty");
-  if(!list.length){ emp.hidden=false; emp.textContent=state.models.length?"没有符合筛选条件的模型。":"模型列表为空。"; }
-  else emp.hidden=true;
-  // 列表本身已按免费白名单筛过，所以默认「只看免费」几乎不减少条数；
-  // 这里仍区分总数与显示数，是为了让「只看国产」与搜索的筛选结果一目了然
-  var cnAll=state.models.filter(function(m){return regionOf(m.id)==="cn";}).length;
-  $("mNote").textContent="可用免费模型 "+state.models.length+" 个（国产 "+cnAll+"）· 当前显示 "+list.length+" 个";
 }
-function renderMStats(){
-  var tot=state.models.length;
-  var free=state.models.filter(isFree).length;
-  var cn=state.models.filter(function(m){return regionOf(m.id)==="cn";}).length;
-  var tested=state.models.filter(function(m){return m.test&&m.test.ok;});
-  var tpss=tested.map(function(m){return m.test.tps;}).filter(function(v){return typeof v==="number"&&isFinite(v)&&v>0;});
-  var ttfts=tested.map(function(m){return m.test.ttft;}).filter(function(v){return typeof v==="number"&&isFinite(v);});
-  var avg=function(a){ return a.length? a.reduce(function(x,y){return x+y;},0)/a.length : null; };
-  // 服务端已按免费白名单筛过，所以"总数"就等于可用免费模型数。
-  // 上游拉取失败会回退到内置列表（含 cline-pass 等非免费项），届时两者不等，
-  // 这种情况额外标出非免费条数，免得让人以为列表里全是免费可用的。
-  var paid=tot-free;
-  $("mStats").innerHTML=[
-    cell("可用免费模型",String(free),"ok"),
-    cell("国产模型",String(cn),"cn"),
-    cell("已测通",tested.length+" / "+tot),
-    cell("平均速度",avg(tpss)!==null?fmtNum(avg(tpss),1)+" tok/s":"-",avg(tpss)!==null?"ok":""),
-    cell("最快首字节",ttfts.length?fmtMs(Math.min.apply(null,ttfts)):"-")
-  ].concat(paid>0?[cell("非免费（回退列表）",String(paid),"")]:[]).join("");
+
+// 添加模型：单卡 ＋ 与整组「全部添加」走同一个接口，服务端把重复项计入 skipped
+function addModelIds(ids, okMsg){
+  if(!ids||!ids.length) return;
+  return fetch("/v1/models/batch",{method:"POST",headers:authHeaders(),body:JSON.stringify({ids:ids})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){ toastError("添加失败",o.d,"HTTP "+o.r.status); return; }
+      var added=o.d.added||[], skipped=o.d.skipped||[], failed=o.d.failed||{};
+      state.owned=o.d.models||[];
+      renderOwnedModels(); renderModelLibrary();
+      if(state.mCatLoaded) renderModelCatalog();
+      var failN=Object.keys(failed).length;
+      if(failN&&!added.length){
+        toast("err","添加失败", esc(Object.values(failed)[0]));
+      } else if(!added.length){
+        toast("warn","这些模型都已添加","未重复添加");
+      } else {
+        var parts=["新增 "+added.length+" 个"];
+        if(skipped.length) parts.push("已存在 "+skipped.length+" 个");
+        if(failN) parts.push("失败 "+failN+" 个");
+        toast("ok", okMsg||"已添加", esc(parts.join("，")));
+      }
+    })
+    .catch(function(e){ toastError("添加请求失败",e); });
 }
+
+function removeModel(id,btn){
+  if(btn){ btn.disabled=true; flash(btn,"移除中"); }
+  fetch("/v1/models/delete",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("移除失败",o.d,"HTTP "+o.r.status); return; }
+      state.owned=o.d.models||[];
+      renderOwnedModels(); renderModelLibrary();
+      if(state.mCatLoaded) renderModelCatalog();
+      toast("ok","已移除", esc(o.d.message||id));
+      loadModels();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("移除请求失败",e); });
+}
+
+function setDefaultModel(id,btn){
+  if(btn){ btn.disabled=true; flash(btn,"设置中"); }
+  fetch("/v1/models/default",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("设置失败",o.d,"HTTP "+o.r.status); return; }
+      state.owned=o.d.models||[];
+      renderOwnedModels();
+      toast("ok","已设为默认", esc(o.d.message||id));
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("设置请求失败",e); });
+}
+
+/* 模型检测：跑起来的检测在服务端有并发上限，所以这里让「同一时刻只跑一个」——
+   面板上连点一排「检测」不该把上游打出一串并发请求（免费通道并发会返回空响应）。 */
+function checkModel(id,btn){
+  if(btn) btn.disabled=true;
+  state.mchecks[id]={status:"running"};
+  refreshCheckUI(id);
+  fetch("/v1/models/check",{method:"POST",headers:authHeaders(),body:JSON.stringify({id:id})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        state.mchecks[id]={status:"failed",error:(o.d.error&&o.d.error.message)||("HTTP "+o.r.status)};
+        refreshCheckUI(id); return;
+      }
+      pollCheck(id,o.d.job.id,0);
+    })
+    .catch(function(e){
+      state.mchecks[id]={status:"failed",error:String(e&&e.message||e)};
+      refreshCheckUI(id);
+    });
+}
+
+function pollCheck(id,jobId,tries){
+  if(tries>60){
+    state.mchecks[id]={status:"failed",error:"检测超时（仍在后台进行）"};
+    refreshCheckUI(id); return;
+  }
+  fetch("/v1/models/check?jobId="+encodeURIComponent(jobId),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){ state.mchecks[id]={status:"failed",error:(d.error&&d.error.message)||"状态不可读"}; refreshCheckUI(id); return; }
+      var j=d.job;
+      if(j.status==="running"){ setTimeout(function(){ pollCheck(id,jobId,tries+1); },1200); return; }
+      if(j.status==="failed"){ state.mchecks[id]={status:"failed",error:j.error||"检测失败"}; refreshCheckUI(id); return; }
+      state.mchecks[id]={status:"done",result:j.result};
+      refreshCheckUI(id);
+    })
+    .catch(function(){ setTimeout(function(){ pollCheck(id,jobId,tries+1); },1500); });
+}
+
+// 只重绘那张卡片的检测状态，不整页重渲染（否则输入框里的搜索词会被清掉）
+function refreshCheckUI(id){
+  var cards=document.querySelectorAll('.mcard[data-mid="'+id.replace(/"/g,'\\"')+'"]');
+  for(var i=0;i<cards.length;i++){
+    var ck=checkState(id);
+    var old=cards[i].querySelector(".mchk");
+    if(ck.text){
+      if(old){ old.className="mchk "+ck.cls; old.textContent=ck.text; }
+      else{
+        var d=document.createElement("div");
+        d.className="mchk "+ck.cls; d.textContent=ck.text;
+        // 插到整个动作行的后面（动作行现在是第二行，结果行跟在它下面）
+        var acts=cards[i].querySelector(".macts");
+        var anchor=acts||cards[i].querySelector(".mrow");
+        if(anchor&&anchor.nextSibling) cards[i].insertBefore(d,anchor.nextSibling);
+        else cards[i].appendChild(d);
+      }
+    } else if(old){ old.parentNode.removeChild(old); }
+    var b=cards[i].querySelector("button[data-check]");
+    if(b){ b.disabled=(ck.btn==="检测中"); b.textContent=ck.btn; }
+  }
+}
+
+// 表格视图（对话页的模型下拉、以及接入配置页要用）——只关心已启用模型，
+// 因为客户端能用的就是这些。
+function loadModels(){
+  return loadOwnedModels().then(function(){
+    var ids=(state.owned||[]).map(function(m){ return m.id; });
+    var sel=$("model");
+    if(!ids.length){
+      sel.innerHTML='<option value="">还没有启用模型</option>';
+      return;
+    }
+    sel.innerHTML=ids.map(function(id){
+      var mm=state.owned.filter(function(x){return x.id===id;})[0]||{};
+      var label=(mm.name&&mm.name!==id)?(mm.name+" · "+id):id;
+      return '<option value="'+esc(id)+'"'+(id===state.model?" selected":"")+">"+esc(label)+"</option>";
+    }).join("");
+    if(ids.indexOf(state.model)<0){ state.model=ids[0]; sel.value=state.model; save(LS.model,state.model); }
+  });
+}
+
 function cell(k,v,cls){ return '<div><div class="k">'+esc(k)+'</div><div class="v '+(cls||"")+'">'+esc(v)+"</div></div>"; }
 
 /* ══ Token 统计 ══
@@ -1846,6 +2603,319 @@ function fmtTok(n){
 // 只显示首/中/末三个横轴标签：30 个日期全放会糊成一团，还不如给最小的定位锚点
 function trendLabelHide(i,total){
   return !(i===0||i===total-1||i===Math.floor(total/2));
+}
+
+/* ══ 上游渠道 ══
+   面板只管「用户想钉什么」；管道归属与可用渠道清单是探测出来的，只读展示。
+   用户填的表单不提交探测字段，服务端会保留缓存（否则每次保存都得重探）。 */
+function loadUpstreams(){
+  $("upList").innerHTML='<div class="box"><div class="pad num" style="color:var(--ink-3)">读取中…</div></div>';
+  return fetch("/v1/upstreams?action=list",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("upList").innerHTML='<div class="box"><div class="pad err"><b>读取失败：</b>'+
+          esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status))+
+          '<br>请先在「接入配置」页填入 API Key。</div></div>';
+        return;
+      }
+      state.upstreams=o.d.upstreams||[];
+      state.upModels=o.d.models||[];
+      $("upNote").textContent=state.upstreams.length+" 个模型已配置";
+      var cnt=$("cnt-up"); if(cnt) cnt.textContent=state.upstreams.length||"";
+      $("upModelList").innerHTML=state.upModels.map(function(m){ return '<option value="'+esc(m)+'">'; }).join("");
+      if(!state.upstreams.length){
+        $("upList").innerHTML='<div class="box"><div class="pad"><div class="empty">'+
+          '还没有任何渠道配置。<br>全部模型都在自动模式下运行（由网关自己挑渠道，通常就是最优解）。</div></div></div>';
+        return;
+      }
+      $("upList").innerHTML=state.upstreams.map(upCard).join("");
+    })
+    .catch(function(e){
+      $("upList").innerHTML='<div class="box"><div class="pad err"><b>请求异常：</b>'+esc(String(e&&e.message||e))+'</div></div>';
+    });
+}
+
+function upCard(cfg){
+  var m=cfg.model_id;
+  var pipe = cfg.pipeline
+    ? '<span class="badge live">'+esc(cfg.pipeline)+'</span>'
+    : '<span class="badge part">未探测</span>';
+  // 钉住生效确认：探测过、有钉住列表、且知道实际命中时才有意义
+  var match="";
+  if(cfg.pipeline&&(cfg.upstreams||[]).length&&cfg.lastProvider){
+    var hit=(cfg.upstreams||[]).some(function(u){ return normSlug(u)===normSlug(cfg.lastProvider); });
+    match=hit?'<span class="ok">✓ 钉住生效</span>':'<span class="bad">✗ 钉住未生效</span>';
+  }
+  var avail=(cfg.available||[]);
+  var probeHtml=
+    '<div class="probe">'+
+      '<div class="row"><span class="k">管道</span>'+(cfg.pipeline?esc(cfg.pipeline):'<span class="warn">未知（未探测）</span>')+
+        '<span class="k" style="margin-left:11px">实际命中</span>'+esc(cfg.lastProvider||"—")+
+        (match?' <span style="margin-left:9px">'+match+'</span>':'')+'</div>'+
+      '<div class="row" style="margin-top:5px"><span class="k">可用渠道（'+avail.length+'）</span></div>'+
+      '<div class="chips" style="margin-top:4px">'+
+        (avail.length?avail.map(function(u){return '<code class="chiplite">'+esc(u)+'</code>';}).join("")
+                     :'<span style="color:var(--ink-3)">未探到清单；可先点「探测」</span>')+
+      '</div>'+
+      (cfg.probedAt?'<div class="row" style="margin-top:5px"><span class="k">探测于</span>'+esc(fmtAgo(cfg.probedAt))+'</div>':'')+
+      '<div class="note" id="probeNote-'+esc(m)+'" hidden></div>'+
+    '</div>';
+
+  function chk(v,val){ return v===val?" selected":""; }
+  function chkB(v,val){ return v===val?" selected":""; }
+
+  return '<div class="box upcard" data-model="'+esc(m)+'">'+
+    '<header>'+
+      '<h3 style="font-size:11.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis">'+esc(m)+'</h3>'+
+      pipe+
+      '<span class="grow"></span>'+
+      '<button class="xs" data-upprobe="'+esc(m)+'">探测</button>'+
+      '<button class="xs ghost" data-updel="'+esc(m)+'">删除配置</button>'+
+    '</header>'+
+    '<div class="upbody">'+
+      '<div class="full">'+probeHtml+'</div>'+
+      '<div>'+
+        '<label class="lb">钉住的渠道（逗号分隔，顺序即优先级）</label>'+
+        '<input data-up="upstreams" value="'+esc((cfg.upstreams||[]).join(", "))+'" placeholder="留空 = 不钉，例如 alibaba, deepinfra">'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">排除的渠道（逗号分隔）</label>'+
+        '<input data-up="exclude" value="'+esc((cfg.exclude||[]).join(", "))+'" placeholder="例如 baseten, novita">'+
+        '<p class="desc" style="margin-top:4px">网关不认排除字段，所以会换算成白名单（依赖上面的可用渠道清单）。</p>'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">钉住模式</label>'+
+        '<select data-up="pinMode">'+
+          '<option value="strict"'+chk(cfg.pinMode,"strict")+'>strict — 只用这些渠道，不回退</option>'+
+          '<option value="preferred"'+chk(cfg.pinMode,"preferred")+'>preferred — 优先这些，允许回退</option>'+
+        '</select>'+
+      '</div>'+
+      '<div>'+
+        '<label class="lb">模型 ID 重定向（发给上游的真实 ID）</label>'+
+        '<input data-up="redirect" value="'+esc(cfg.redirect||"")+'" placeholder="留空 = 原样透传">'+
+      '</div>'+
+      '<div class="full">'+
+        '<label class="lb">别名（逗号分隔，同样适用本配置的其它模型 ID）</label>'+
+        '<input data-up="aliases" value="'+esc((cfg.aliases||[]).join(", "))+'" placeholder="例如 my-glm, team/glm">'+
+      '</div>'+
+      '<div class="full" style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">'+
+        '<button class="primary" data-upsave="'+esc(m)+'">保存</button>'+
+        '<span class="upmeta">管道：<code>'+(cfg.pipeline||"未知")+'</code>　'+
+        '探测结果会随保存一起保留，不必重探。</span>'+
+      '</div>'+
+    '</div>'+
+  '</div>';
+}
+
+// 渠道名归一化：direct 管道回的 provider 是显示名（"DeepInfra"），
+// 而清单里是 slug（"deepinfra"），比对前必须归一化，否则会误判「未生效」。
+function normSlug(s){ return String(s||"").toLowerCase().replace(/[^a-z0-9]/g,""); }
+
+// 逗号分隔输入 → 数组（去空白与空项）
+function splitList(v){
+  return String(v||"").split(",").map(function(s){return s.trim();}).filter(function(s){return s;});
+}
+
+function upSave(modelId,btn){
+  var card=document.querySelector('.upcard[data-model="'+modelId+'"]');
+  if(!card){ return; }
+  var get=function(f){ var el=card.querySelector('[data-up="'+f+'"]'); return el?el.value:""; };
+  var cfg={
+    upstreams:splitList(get("upstreams")),
+    exclude:splitList(get("exclude")),
+    pinMode:get("pinMode"),
+    redirect:get("redirect").trim(),
+    aliases:splitList(get("aliases"))
+  };
+  if(btn){ btn.disabled=true; flash(btn,"保存中"); }
+  fetch("/v1/upstreams?action=save",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId,config:cfg})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("保存失败",o.d,"HTTP "+o.r.status); return; }
+      toast("ok","已保存", esc(o.d.message||""));
+      loadUpstreams();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("保存请求失败",e); });
+}
+
+/* 探测是异步的：服务端立刻返回 jobId，这里轮询状态。
+   探测要打两次上游，同步等会让页面转圈到超时。 */
+function upProbe(modelId,btn){
+  if(btn){ btn.disabled=true; flash(btn,"探测中"); }
+  var note=document.getElementById("probeNote-"+modelId);
+  var showNote=function(html){
+    if(!note) return;
+    note.hidden=false; note.innerHTML=html;
+  };
+  showNote('<span class="warn">正在探测：先发一次真实请求判定管道，再枚举可用渠道…</span>');
+
+  fetch("/v1/upstreams?action=probe",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){
+        showNote('<span class="bad">探测启动失败：</span>'+esc((o.d.error&&o.d.error.message)||("HTTP "+o.r.status)));
+        toastError("探测启动失败",o.d,"HTTP "+o.r.status);
+        return;
+      }
+      if(o.d.shared) showNote('<span class="warn">该模型已有一个探测在进行，共享其结果…</span>');
+      pollProbe(o.d.job.id,modelId,note,0);
+    })
+    .catch(function(e){
+      if(btn) btn.disabled=false;
+      showNote('<span class="bad">请求异常：</span>'+esc(String(e&&e.message||e)));
+    });
+}
+
+function pollProbe(jobId,modelId,note,tries){
+  // 最多等 ~2 分钟（探测自身超时是 5 分钟，但页面不该无限转）
+  if(tries>80){
+    if(note){ note.hidden=false; note.innerHTML='<span class="warn">探测仍在后台进行，稍后点「刷新」查看结果。</span>'; }
+    return;
+  }
+  fetch("/v1/upstreams?action=probe_status&jobId="+encodeURIComponent(jobId),{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){
+        if(note){ note.hidden=false; note.innerHTML='<span class="warn">'+esc((d.error&&d.error.message)||"探测状态不可读")+'</span>'; }
+        return;
+      }
+      var j=d.job;
+      if(j.status==="running"){ setTimeout(function(){ pollProbe(jobId,modelId,note,tries+1); },1500); return; }
+      if(j.status==="failed"){
+        if(note){ note.hidden=false; note.innerHTML='<span class="bad">探测失败：</span>'+esc(j.error||"未知原因"); }
+        return;
+      }
+      var r2=j.result||{};
+      var hasPin=(r2.modelId?true:false);
+      var hit=r2.providerMatch?'<span class="ok">✓ 钉住生效</span>':'<span class="warn">（未配钉住，或钉住未生效）</span>';
+      if(note){
+        note.hidden=false;
+        note.innerHTML=
+          '<span class="k">管道</span> '+esc(r2.pipeline||"未知")+
+          '　<span class="k">实际命中</span> '+esc(r2.provider||"—")+
+          '　'+hit+
+          '　<span class="k">耗时</span> '+esc(fmtMs(r2.latencyMs))+
+          '<br><span class="k">可用渠道（'+((r2.available||[]).length)+'）</span> '+
+          ((r2.available||[]).length?esc(r2.available.join(", ")):'<span class="warn">未能枚举</span>')+
+          (r2.note?'<br><span class="k">说明</span> '+esc(r2.note):'');
+      }
+      toast("ok","探测完成","管道 "+esc(r2.pipeline||"未知")+"，可用渠道 "+((r2.available||[]).length)+" 个");
+      // 重新拉一次：管道归属与可用清单已写回配置，卡片上的白名单要跟着更新
+      loadUpstreams();
+    })
+    .catch(function(){
+      setTimeout(function(){ pollProbe(jobId,modelId,note,tries+1); },2000);
+    });
+}
+
+function upDelete(modelId,btn){
+  if(!confirm("删除这个模型的渠道配置？\n\n删除后该模型回到自动模式（由网关自己挑渠道）。冷却记录不受影响。")) return;
+  if(btn){ btn.disabled=true; flash(btn,"删除中"); }
+  fetch("/v1/upstreams?action=delete",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:modelId})})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("删除失败",o.d,"HTTP "+o.r.status); return; }
+      toast("ok","已删除", esc(o.d.message||"")); loadUpstreams();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("删除请求失败",e); });
+}
+
+/* ══ 设置 ══ */
+function loadSettings(){
+  return fetch("/v1/config",{headers:authHeaders(),cache:"no-store"})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(!o.r.ok||!o.d.ok){
+        $("setNote").innerHTML='<span style="color:var(--bad)">读取失败：请先在「接入配置」页填入 API Key</span>';
+        return;
+      }
+      renderSettings(o.d);
+    })
+    .catch(function(e){
+      $("setNote").innerHTML='<span style="color:var(--bad)">请求异常：'+esc(String(e&&e.message||e))+'</span>';
+    });
+}
+
+function renderSettings(c){
+  state.config=c;
+  $("setStrategy").value=c.strategy||"round_robin";
+  $("setCooldown").value=c.cooldown_minutes||30;
+  $("setOverride").value=c.override_prompt||"";
+
+  // 默认模型下拉：选项来自**已启用模型**（服务端 default_model_options）。
+  // 不再从 state.models 取——那曾经是"全部免费模型"，现在是已启用列表，
+  // 而默认模型只能从已启用里挑（服务端也这么校验）。
+  var opts=['<option value="">（跟随列表第一个：'+esc(c.default_model)+'）</option>'];
+  var options=c.default_model_options||[];
+  options.forEach(function(m){
+    var label=(m.name&&m.name!==m.id)?(m.name+" · "+m.id):m.id;
+    opts.push('<option value="'+esc(m.id)+'"'+(c.default_model===m.id?" selected":"")+'>'+esc(label)+'</option>');
+  });
+  // 一个模型都没启用时（回退内置推荐）说明一句，否则下拉里只有"跟随"会让人困惑
+  if(!options.length){
+    opts.push('<option value="" disabled>还没有启用任何模型</option>');
+  }
+  $("setDefaultModel").innerHTML=opts.join("");
+
+  // 请求头：内置值做占位提示，当前的覆盖值填进输入框
+  var def=c.default_headers||{}, cur=c.headers||{};
+  var keys=Object.keys(def);
+  Object.keys(cur).forEach(function(k){ if(keys.indexOf(k)<0) keys.push(k); });
+  keys.sort();
+  $("hdrGrid").innerHTML=keys.map(function(k){
+    return '<div><label title="'+esc(k)+'">'+esc(k)+'</label>'+
+      '<input data-hdr="'+esc(k)+'" value="'+esc(cur[k]||"")+'" placeholder="'+esc(def[k]||"")+'">'+
+    '</div>';
+  }).join("")||'<div class="desc">没有可配置的请求头。</div>';
+
+  $("setNote").textContent="读取于 "+fmtClock(Date.now());
+  $("setPersist").innerHTML = c.persisted
+    ? '<div class="okbox">设置在本地会自动存盘（<code>~/.cline-free-state.local.json</code>），重启不丢。</div>'
+    : '<div class="warnbox">当前运行环境没有可写磁盘（云端部署），改动只对本次实例生效，重启或重新部署后恢复。<br>'+
+      '要长期保留：本地运行本服务，或把改动写进部署环境变量。</div>';
+}
+
+function saveSettings(btn){
+  var hdrs={};
+  var inputs=$("hdrGrid").querySelectorAll("input[data-hdr]");
+  for(var i=0;i<inputs.length;i++){
+    var k=inputs[i].getAttribute("data-hdr"), v=inputs[i].value.trim();
+    if(v) hdrs[k]=v;
+  }
+  var payload={
+    strategy:$("setStrategy").value,
+    cooldown_minutes:Number($("setCooldown").value),
+    default_model:$("setDefaultModel").value,
+    override_prompt:$("setOverride").value,
+    headers:hdrs,
+    // 请求头整体替换：输入框里空着的行就是要删掉的头，合并语义删不掉
+    replace_headers:true
+  };
+  if(btn){ btn.disabled=true; flash(btn,"保存中"); }
+  fetch("/v1/config",{method:"POST",headers:authHeaders(),body:JSON.stringify(payload)})
+    .then(function(r){ return r.json().then(function(d){ return {r:r,d:d}; }); })
+    .then(function(o){
+      if(btn) btn.disabled=false;
+      if(!o.r.ok||!o.d.ok){ toastError("保存失败",o.d,"HTTP "+o.r.status); return; }
+      renderSettings(o.d);
+      toast("ok","设置已保存","");
+      // 策略/默认模型也会影响健康页展示，顺手刷新
+      loadHealth();
+    })
+    .catch(function(e){ if(btn) btn.disabled=false; toastError("保存请求失败",e); });
+}
+
+function resetHeaders(){
+  var inputs=$("hdrGrid").querySelectorAll("input[data-hdr]");
+  for(var i=0;i<inputs.length;i++) inputs[i].value="";
+  $("setNote").textContent="已清空覆盖值（内置默认仍生效），点「保存设置」提交";
 }
 
 function renderUsage(){
@@ -2005,131 +3075,6 @@ function renderUsage(){
   $("cnt-usage").textContent=t.total?fmtTok(t.total):"";
 }
 
-function testModel(id){
-  var m=null;
-  for(var i=0;i<state.models.length;i++) if(state.models[i].id===id){ m=state.models[i]; break; }
-  if(!m||(m.test&&m.test.busy)) return;
-  m.test={busy:true,ok:false,ttft:null,tps:null};
-  renderMRows();
-  var ctrl=new AbortController();
-  var timer=setTimeout(function(){ try{ctrl.abort();}catch(e){} },40000);
-  var t0=performance.now(), ttft=null, chars=0, tokens=null, usage=null, early=false;
-  var body={model:id,stream:true,messages:[{role:"user",content:"从 1 数到 25，用英文逗号分隔，只输出数字本身。"}]};
-  var reqBody=JSON.stringify(body,null,2);
-
-  fetch("/v1/chat/completions",{method:"POST",headers:authHeaders(),body:JSON.stringify(body),signal:ctrl.signal})
-    .then(function(r){
-      if(!r.ok){
-        return r.text().then(function(txt){
-          clearTimeout(timer);
-          m.test={ok:false,ttft:null,tps:null,error:"HTTP "+r.status,hint:explain(r.status,txt)};
-          renderMRows(); renderMStats();
-          addLog({kind:"test",model:id,stream:true,ok:false,status:r.status,error:"HTTP "+r.status+" "+txt.slice(0,400),hint:explain(r.status,txt),requestBody:reqBody,responseRaw:txt.slice(0,4000)});
-          persistTest(id,m.test);
-        });
-      }
-      var reader=r.body.getReader(), dec=new TextDecoder(), buf="";
-      function pump(){
-        return reader.read().then(function(s){
-          if(s.done) return null;
-          buf+=dec.decode(s.value,{stream:true});
-          var ix;
-          while((ix=buf.indexOf("\n"))>=0){
-            var line=buf.slice(0,ix); buf=buf.slice(ix+1);
-            if(line.indexOf("data:")!==0) continue;
-            var p=line.slice(5).trim();
-            if(!p||p==="[DONE]") continue;
-            try{
-              var o=JSON.parse(p), c=o.choices&&o.choices[0], dl=(c&&c.delta)||{};
-              if(ttft===null&&(dl.content||dl.reasoning)) ttft=performance.now()-t0;
-              if(dl.content) chars+=dl.content.length;
-              if(o.usage) usage=o.usage;
-            }catch(e){}
-          }
-          if(usage||chars>=120){ early=true; try{ctrl.abort();}catch(e){} return null; }
-          return pump();
-        });
-      }
-      return pump().then(function(){
-        clearTimeout(timer);
-        var totalMs=performance.now()-t0;
-        if(usage) tokens=usage.completion_tokens||null;
-        var genMs=Math.max(totalMs-(ttft||0),1);
-        var tps=tokens? tokens/(genMs/1000) : (chars? chars/(genMs/1000) : null);
-        if(ttft===null){
-          m.test={ok:false,ttft:null,tps:null,error:"无响应内容",hint:"上游返回 200 但没有内容，重试通常即可。"};
-        } else {
-          m.test={ok:true,ttft:ttft,tps:tps,basis:tokens?"token":"chars",tokens:tokens,chars:chars,genMs:genMs,totalMs:totalMs,early:early};
-        }
-        renderMRows(); renderMStats();
-        addLog({kind:"test",model:id,stream:true,ok:m.test.ok,status:200,ttft:m.test.ttft,totalMs:totalMs,genMs:genMs,tokens:tokens,chars:chars,tps:tps,tpsBasis:m.test.basis,
-          promptTokens:usage?usage.prompt_tokens:null,completionTokens:usage?usage.completion_tokens:null,totalTokens:usage?usage.total_tokens:null,
-          reasoningTokens:usage&&usage.completion_tokens_details?usage.completion_tokens_details.reasoning_tokens:null,
-          stopped:early,note:"模型页测速，拿到样本后主动中止",error:m.test.ok?null:m.test.error,hint:m.test.ok?null:m.test.hint,
-          requestBody:reqBody,responseRaw:usage?JSON.stringify(usage,null,2):"已中止（未取得 usage）"});
-        persistTest(id,m.test);
-      });
-    })
-    .catch(function(e){
-      clearTimeout(timer);
-      var stopped=String(e&&e.name)==="AbortError";
-      if(stopped&&ttft!==null){
-        var tm=performance.now()-t0, gm=Math.max(tm-ttft,1);
-        m.test={ok:true,ttft:ttft,tps:tokens?tokens/(gm/1000):(chars?chars/(gm/1000):null),basis:tokens?"token":"chars",tokens:tokens,chars:chars,genMs:gm,totalMs:tm,early:true};
-      } else {
-        m.test={ok:false,ttft:null,tps:null,error:stopped?"超时":String(e&&e.message||e).slice(0,80),hint:stopped?"40 秒内没有收到内容，可能上游繁忙或该模型不可用。":"请求异常，检查服务是否在运行。"};
-      }
-      renderMRows(); renderMStats();
-      addLog({kind:"test",model:id,stream:true,ok:m.test.ok,status:m.test.ok?200:null,ttft:m.test.ttft,totalMs:m.test.totalMs,genMs:m.test.genMs,
-        tokens:m.test.tokens,chars:m.test.chars,tps:m.test.tps,tpsBasis:m.test.basis,stopped:m.test.early,note:"模型页测速",
-        error:m.test.ok?null:m.test.error,hint:m.test.ok?null:m.test.hint,requestBody:reqBody});
-      persistTest(id,m.test);
-    })
-    .then(function(){
-      if(m.test) delete m.test.busy;
-      state.testingIds[id]=m.test||null;
-      renderMRows();
-    });
-}
-function persistTest(id,t){
-  var saved=load(LS.tests,{})||{};
-  saved[id]={ok:!!t.ok,ttft:t.ttft||null,tps:t.tps||null,basis:t.basis||null,tokens:t.tokens||null,chars:t.chars||null,
-    genMs:t.genMs||null,totalMs:t.totalMs||null,error:t.error||null,hint:t.hint||null,at:Date.now()};
-  var ks=Object.keys(saved);
-  if(ks.length>80){
-    ks.sort(function(a,b){ return (saved[a].at||0)-(saved[b].at||0); });
-    for(var i=0;i<ks.length-80;i++) delete saved[ks[i]];
-  }
-  save(LS.tests,saved);
-}
-function testAll(){
-  if(state.testing) return;
-  var targets=visibleModels().map(function(m){return m.id;});
-  if(!targets.length) return;
-  state.testing=true;
-  $("btnTestAll").disabled=true; $("btnStopTest").hidden=false; $("mBar").hidden=false;
-  $("mBar").querySelector("i").style.width="0%";
-  var i=0;
-  function next(){
-    if(!state.testing||i>=targets.length){
-      state.testing=false; $("btnTestAll").disabled=false; $("btnStopTest").hidden=true;
-      setTimeout(function(){ $("mBar").hidden=true; },900);
-      return;
-    }
-    var id=targets[i++];
-    testModel(id);
-    // 等这个模型测完再做下一个（轮询 busy 标记）
-    var waited=0;
-    (function wait(){
-      var mm=null;
-      for(var k=0;k<state.models.length;k++) if(state.models[k].id===id){ mm=state.models[k]; break; }
-      if((mm&&mm.test&&mm.test.busy)&&waited<45000){ waited+=250; setTimeout(wait,250); return; }
-      $("mBar").querySelector("i").style.width=Math.round(i/targets.length*100)+"%";
-      setTimeout(next,250);
-    })();
-  }
-  next();
-}
 
 /* ══ 对话 ══ */
 function renderThread(){
@@ -2532,49 +3477,127 @@ document.querySelectorAll(".chip").forEach(function(c){
 });
 $("btnClearLogs").addEventListener("click",function(){ state.logs=[]; state.selId=null; save(LS.logs,[]); renderLogs(); });
 $("btnExportLogs").addEventListener("click",exportLogs);
-$("mRows").addEventListener("click",function(e){
-  var t=e.target.closest&&e.target.closest("[data-test]");
-  if(t){ testModel(t.getAttribute("data-test")); return; }
-  var u=e.target.closest&&e.target.closest("[data-use]");
-  if(u){
-    state.model=u.getAttribute("data-use"); $("model").value=state.model; save(LS.model,state.model);
-    renderSnip(); showTab("chat");
+/* 模型库：一个委托处理三种卡片上的动作（推荐分组 / 全部模型 / 已启用三处共用）。
+   卡片会整块重绘，所以只能走事件委托，不能逐个绑定。 */
+document.addEventListener("click",function(e){
+  var t=e.target.closest&&e.target.closest("button[data-add]");
+  if(t){ addModelIds([t.getAttribute("data-add")],"已添加"); return; }
+  var g=e.target.closest&&e.target.closest("button[data-addgroup]");
+  if(g){
+    var key=g.getAttribute("data-addgroup");
+    var groups=(state.mLibGroups||[]).concat(state.mCatalog||[]);
+    var hit=null;
+    for(var i=0;i<groups.length;i++) if(groups[i].key===key){ hit=groups[i]; break; }
+    if(!hit){ toast("warn","找不到该分组","请点「刷新数据」后重试。"); return; }
+    addModelIds(hit.models.map(function(m){ return m.id; }),"已添加整组");
+    return;
   }
+  var c=e.target.closest&&e.target.closest("button[data-check]");
+  if(c){ checkModel(c.getAttribute("data-check"),c); return; }
+  var rm=e.target.closest&&e.target.closest("button[data-rm]");
+  if(rm){ removeModel(rm.getAttribute("data-rm"),rm); return; }
+  var sd=e.target.closest&&e.target.closest("button[data-setdefault]");
+  if(sd){ setDefaultModel(sd.getAttribute("data-setdefault"),sd); return; }
+  var cp=e.target.closest&&e.target.closest("button[data-copyid]");
+  if(cp){ copyText(cp.getAttribute("data-copyid"),cp); return; }
 });
-document.querySelectorAll("table.m th.sort").forEach(function(th){
-  th.addEventListener("click",function(){
-    var k=th.getAttribute("data-s");
-    if(state.sort===k) state.sortDir=-state.sortDir;
-    else { state.sort=k; state.sortDir=1; }
-    document.querySelectorAll("table.m th.sort .ar").forEach(function(a){ a.remove(); });
-    var ar=document.createElement("span"); ar.className="ar"; ar.textContent=state.sortDir>0?"↑":"↓";
-    th.appendChild(ar);
-    save(LS.sort,{key:state.sort,dir:state.sortDir});
-    renderMRows();
+/* 全部模型的搜索：只过滤本地已有数据，不发请求。
+   绑 input（覆盖键盘与粘贴）与 search（type=search 自带的清除按钮不一定触发 input），
+   外加 Esc 清空。 */
+(function(){
+  var el=$("mCatSearch");
+  el.addEventListener("input",function(){ renderModelCatalog(); });
+  el.addEventListener("search",function(){ renderModelCatalog(); });
+  el.addEventListener("keydown",function(e){
+    if(e.key==="Escape"){ el.value=""; renderModelCatalog(); }
   });
+})();
+// 全部模型折叠块：展开时才抓（上游 440+ 条、约 500 KB，没必要在页面加载时一起拉）
+$("mCatalogFold").addEventListener("toggle",function(){
+  if(!this.open) return;
+  if(state.mCatLoaded){ renderModelCatalog(); return; }
+  loadModelCatalog(false);
 });
-$("mfilter").addEventListener("input",function(){ renderMRows(); });
-$("mfree").addEventListener("change",function(){ save(LS.freeOnly,this.checked); renderMRows(); renderMStats(); });
-$("mcn").addEventListener("change",function(){ renderMRows(); });
-$("btnReloadModels").addEventListener("click",function(){ loadModels(); });
-$("btnTestAll").addEventListener("click",testAll);
-$("btnStopTest").addEventListener("click",function(){ state.testing=false; });
+$("mRefreshBtn").addEventListener("click",function(){
+  loadModelLibrary(true);
+  if(state.mCatLoaded) loadModelCatalog(true);
+});
+$("mDescBtn").addEventListener("click",function(){
+  var on=document.body.classList.toggle("show-mdesc");
+  this.textContent=on?"隐藏描述":"显示描述";
+});
 $("btnRefreshAcct").addEventListener("click",function(){ loadHealth(); });
 $("btnLogin").addEventListener("click",startLogin);
 
 /* 账号卡片上的动作按钮与批量按钮：统一走事件委托，
    这样 renderAccts 重绘多少次都不用重新绑定。 */
 function onAcctBarClick(e){
+  // 详情/余额按钮不带 data-act（它们不发账号动作请求），单独处理
+  var db=e.target.closest&&e.target.closest("button[data-detail]");
+  if(db){ openAcctDetail(db.getAttribute("data-detail")); return; }
+  var bb=e.target.closest&&e.target.closest("button[data-balance]");
+  if(bb){
+    // 余额也走弹窗：这样「查不到原因」的提示能一起显示，而不是只弹个 toast
+    openAcctDetail(bb.getAttribute("data-balance"));
+    setTimeout(function(){ var b=$("btnBal"); if(b) b.click(); }, 400);
+    return;
+  }
+  var cb=e.target.closest&&e.target.closest("button[data-clear]");
+  if(cb){
+    accountAction("clearCooldown",cb.getAttribute("data-clear"),cb,cb.getAttribute("data-model"));
+    return;
+  }
   var b=e.target.closest&&e.target.closest("button[data-act]");
   if(!b) return;
   var act=b.getAttribute("data-act"), id=b.getAttribute("data-id")||"";
   // 破坏性动作先确认：移除账号无法撤销（停用可以随时启用，不必打扰）
-  if(act==="remove"&&!confirm("移除这个临时账号？\n\n它只存在于当前实例内存，移除后需要重新登录才能恢复。")) return;
+  if(act==="remove"&&!confirm("移除这个账号？\n\n移除后需要重新登录才能恢复。")) return;
   accountAction(act,id,b);
 }
 $("accts").addEventListener("click",onAcctBarClick);
+// 详情弹窗里的「解除冷却」也走同一套动作
+document.addEventListener("click",function(e){
+  var cb=e.target.closest&&e.target.closest("button[data-clear]");
+  if(!cb) return;
+  if($("accts").contains(cb)) return;   // 卡片上的已由上面的委托处理
+  accountAction("clearCooldown",cb.getAttribute("data-clear"),cb,cb.getAttribute("data-model"));
+});
 $("btnEnableAll").addEventListener("click",function(){ accountAction("enableAll","",this); });
 $("btnResetAll").addEventListener("click",function(){ accountAction("resetAll","",this); });
+
+/* 上游渠道面板与设置页的事件委托（面板会整体重绘，不能逐个绑定） */
+document.addEventListener("click",function(e){
+  var t=e.target.closest&&e.target.closest(
+    "button[data-upsave], button[data-updel], button[data-upprobe]");
+  if(!t) return;
+  if(t.hasAttribute("data-upsave")) return upSave(t.getAttribute("data-upsave"),t);
+  if(t.hasAttribute("data-updel")) return upDelete(t.getAttribute("data-updel"),t);
+  upProbe(t.getAttribute("data-upprobe"),t);
+});
+$("btnUpAdd").addEventListener("click",function(){
+  var id=$("upModel").value.trim();
+  if(!id){ toast("warn","请先选择模型","从下拉里挑一个模型 ID，或直接粘贴。"); return; }
+  // 直接建一条空配置（服务端对空配置视为「无有效内容」而删除，所以先给个占位渠道）
+  // —— 这里改为：建一条只有 pinMode 的配置，让用户填完再保存。
+  fetch("/v1/upstreams?action=save",{method:"POST",headers:authHeaders(),
+    body:JSON.stringify({model_id:id,config:{pinMode:"strict",upstreams:[]}})})
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(!d.ok){ toastError("添加失败",d); return; }
+      $("upModel").value="";
+      // 空配置会被服务端判为无效而删除，此时提示用户先填渠道
+      if(!d.config){ toast("warn","已就绪","该模型还没有有效配置，填好钉住的渠道后点「保存」。"); }
+      loadUpstreams().then(function(){
+        var el=document.querySelector('.upcard[data-model="'+id+'"] input[data-up="upstreams"]');
+        if(el) el.focus();
+      });
+    })
+    .catch(function(err){ toastError("添加请求失败",err); });
+});
+$("btnUpReload").addEventListener("click",loadUpstreams);
+$("btnSetSave").addEventListener("click",function(){ saveSettings(this); });
+$("btnSetReload").addEventListener("click",function(){ loadSettings(); });
+$("btnHdrReset").addEventListener("click",resetHeaders);
 $("btnLoginCancel").addEventListener("click",cancelLogin);
 $("btnSend").addEventListener("click",send);
 $("btnStop").addEventListener("click",stopGen);

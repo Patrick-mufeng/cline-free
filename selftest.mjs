@@ -46,50 +46,148 @@ const upstream = createServer(async (req, res) => {
     return;
   }
 
-  // recommended-models：官方四个分类数组，是权威的渠道来源
+  // recommended-models：官方四个分类数组（带 name/description/tags）
   if (req.url.includes("recommended-models")) {
+    if (mode.models === "fail") { res.writeHead(500); return res.end("boom"); }
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
-      recommended: [{ id: "openai/gpt-6-astra", name: "gpt-6-astra" }],
-      free: [{ id: "z-ai/glm-5.3-flash", name: "glm-5.3-flash" },
-             { id: "cline-free/deepseek-v4.1-flash", name: "Deepseek-v4.1-Flash" },
-             // 只存在于 free 数组、不在 /v1/models 里的官方免费通道 →
-             // 必须被补进模型池（现实里 cline-free/* 就是这样，且它是默认模型所在）
-             { id: "cline-free/muse-spark-1.3-contributor", name: "Muse-Spark-1.3" }],
-      clinePass: [{ id: "cline-pass/glm-5.2" }],
-      clineCloud: [{ id: "cline-cloud/kimi-k3" }],
+      recommended: [{ id: "openai/gpt-6-astra", name: "gpt-6-astra", description: "Astral", tags: ["NEW"] }],
+      free: [
+        { id: "z-ai/glm-5.3-flash", name: "GLM 5.3 Flash", description: "Cheap and fast", tags: [] },
+        { id: "cline-free/deepseek-v4.1-flash", name: "Deepseek-v4.1-Flash", description: "1M context", tags: [] },
+      ],
+      clinePass: [{ id: "cline-pass/glm-5.2", name: "cline-pass/glm-5.2", description: "Pass only", tags: [] }],
+      clineCloud: [{ id: "cline-cloud/kimi-k3", name: "Kimi K3", description: "Cloud", tags: [] }],
     }));
     return;
   }
 
-  if (req.url.includes("/models")) {
+  // 全部模型清单：平铺列表，带 context_length / pricing
+  if (req.url.includes("/ai/cline/models")) {
+    if (mode.models === "fail") { res.writeHead(500); return res.end("boom"); }
     res.writeHead(200, { "Content-Type": "application/json" });
-    // 故意混合几类，逐条验证白名单语义下谁进谁出：
-    //   放行 = 带 :free 后缀的，或 FREE_WHITELIST 里的
-    //   丢弃 = 其余全部（哪怕官方分类把它归在 recommended 里）
     res.end(JSON.stringify({
       data: [
-        { id: "cline-free/deepseek-v4.1-flash" },  // 白名单 + 官方 free 分类 → 免费
-        { id: "z-ai/glm-5.3-flash" },              // 白名单 + 官方 free 分类 → 免费
-        { id: "deepseek/deepseek-v4-flash" },      // 白名单，但官方无分类 → 实测免费
-        { id: "nvidia/nemotron-3-super-120b-a12b:free" }, // :free 后缀 → 免费
-        { id: "openai/gpt-6-astra" },              // 官方 recommended 但不在白名单 → 丢弃
-        { id: "cline-pass/glm-5.2" },              // 需订阅 → 丢弃
-        { id: "unknown-vendor/mystery-model" },    // 无任何信息 → 丢弃
-        { id: "poolside/laguna-s-2.1:free:batch" },// :batch 通道 → 即便带 :free 也排除
-        { id: "~deepseek/deepseek-v4-flash-0731" }, // ~ 别名，去波浪号后命中白名单 → 保留
-        { id: "~openai/gpt-latest" },              // ~ 别名，去波浪号后不在白名单 → 丢弃
+        { id: "x-ai/grok-4.7", name: "Grok 4.7", description: "Flagship", context_length: 500000, pricing: { prompt: "0.0000016" } },
+        { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", description: "Fast", context_length: 128000, pricing: { prompt: "0" } },
+        // ~ 前缀是 ID 本身的一部分（上游自己的 canonical_slug 也带它），不该被剥掉
+        { id: "~deepseek/deepseek-pro-latest", name: "DeepSeek Pro Latest", description: "Alias", context_length: 128000, pricing: {} },
+        { id: "qwen/qwen3.8-27b:free", name: "Qwen3.8", description: "Free tier", context_length: 32000, pricing: {} },
       ],
     }));
     return;
   }
 
+  // /v1/models（旧接口，已不再用于模型库；保留以免误伤其它请求路径）
+  if (req.url.includes("/models")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ data: [] }));
+    return;
+  }
+
   // chat/completions
-  upstreamCalls.push({ body: JSON.parse(bodyText || "{}"), auth: req.headers.authorization });
+  upstreamCalls.push({
+    body: JSON.parse(bodyText || "{}"),
+    auth: req.headers.authorization,
+    // 请求头快照：验证「自定义请求头覆盖内置值」与「未覆盖的指纹头仍在」
+    ua: req.headers["user-agent"],
+    clientType: req.headers["x-client-type"],
+  });
+
+  // 模拟上游路由元数据与渠道枚举：用于验证探测解析、管道判定、钉住生效确认。
+  //
+  // 两条管道的响应形态完全不同，所以两种都要能模拟：
+  //   planner：元数据在 choices[0].message.provider_metadata.gateway.routing
+  //   direct ：顶层带 provider（显示名）+ model（真实上游 ID）
+  if (mode.kind === "routing") {
+    const reqBody = JSON.parse(bodyText || "{}");
+    // 带哨兵渠道名的枚举请求：网关在路由层拒绝并回吐清单
+    if (JSON.stringify(reqBody).includes("__probe__")) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: { message: "No provider matched. Available providers are: alibaba, baseten, deepinfra, novita" },
+      }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    if (mode.pipeline === "planner") {
+      res.end(JSON.stringify({
+        data: {
+          id: "gen_route",
+          choices: [{
+            index: 0,
+            message: {
+              role: "assistant",
+              content: "ok",
+              provider_metadata: {
+                gateway: {
+                  routing: {
+                    finalProvider: mode.provider || "alibaba",
+                    canonicalSlug: "some/real-model",
+                    fallbacksAvailable: ["baseten", "novita"],
+                  },
+                },
+              },
+            },
+            finish_reason: "stop",
+          }],
+          usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+        },
+      }));
+      return;
+    }
+    // direct：顶层 provider 是**显示名**（带大小写），钉住比对的 slug 是小写的
+    res.end(JSON.stringify({
+      data: {
+        id: "gen_route",
+        provider: mode.provider || "DeepInfra",
+        model: "deepseek/deepseek-v4-flash-0731",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    }));
+    return;
+  }
+
+  // 任意状态码：用于验证「上游状态码 → 客户端状态码」的映射
+  if (mode.kind === "code") {
+    res.writeHead(mode.status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(mode.body || {}));
+    return;
+  }
+
+  // 上游先吐半句话再断开（不发 [DONE]）：模拟流中途失败。
+  // 用于验证「必须发 error 事件，且不能补正常收尾事件」。
+  if (mode.kind === "truncate") {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: " + JSON.stringify({
+      data: {
+        id: "gen_trunc",
+        model: "cline-free/deepseek-v4.1-flash",
+        choices: [{ index: 0, delta: { content: "半句话" }, finish_reason: null }],
+      },
+    }) + "\n\n");
+    // 直接销毁连接：客户端会拿到一个非 EOF 的读取错误
+    await new Promise((r) => setTimeout(r, 50));
+    res.destroy();
+    return;
+  }
 
   if (mode.kind === "429") {
     res.writeHead(429, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: { message: "Daily free limit reached. Try again in 10m" } }));
+    // 用官方真实文案：marker "free limit reached on model" 是判定「免费日额度」的依据
+    // （取自 Cline 客户端源码）。写别的措辞会被正确归类为 unknown —— 见【5b】。
+    res.end(JSON.stringify({
+      error: { message: "Daily free model limit reached: free limit reached on model " + (mode.model || "cline-free/deepseek-v4.1-flash") + ". Try again in 10m" },
+    }));
+    return;
+  }
+
+  // 无法识别的 429：上游改了文案的情况。不该被误判成「额度用尽」，
+  // 但冷却仍然要生效（退回配置里的兜底时长）。
+  if (mode.kind === "429-unknown") {
+    res.writeHead(429, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "Something new from upstream, try later" } }));
     return;
   }
 
@@ -113,6 +211,23 @@ const upstream = createServer(async (req, res) => {
     }) + "\n\n");
     res.write("data: [DONE]\n\n");
     res.end();
+    return;
+  }
+
+  // 非流式请求：真实上游这时回的是普通 JSON。模型可用性检测走这条路径
+  // （它读的是 message.content，不是 SSE 分片），所以这里必须区分对待——
+  // 一律回 SSE 会让检测以为"正文为空"，测出假失败。
+  const isStreamReq = bodyText ? JSON.parse(bodyText).stream === true : false;
+  if (!isStreamReq) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      data: {
+        id: "gen_nonstream",
+        model: "cline-free/deepseek-v4.1-flash",
+        choices: [{ index: 0, message: { role: "assistant", content: "OK" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+      },
+    }));
     return;
   }
 
@@ -295,8 +410,27 @@ console.log("\n【5】429 限流：冷却切号、不空转");
     upstreamCalls.length === 2, "上游被调用: " + upstreamCalls.length + " 次");
 
   const h = await (await worker.fetch(new Request("https://x.dev/v1/health"), env5)).json();
-  check("health 显示两账号均冷却（accounts_available=0）",
-    h.accounts_available === 0, "accounts_available=" + h.accounts_available);
+  // 冷却改成「账号×模型」级：health 的 accounts_available 只反映「账号是否启用」，
+  // 具体哪个模型受限看 cooling_combinations / /v1/status 的 account_details。
+  // 这里断言的是「这个模型确实被记了冷却」，而不是「账号不可用」。
+  check("health 报告该模型已有冷却组合",
+    h.cooling_combinations === 2, "cooling_combinations=" + h.cooling_combinations);
+  check("health 仍把两个账号算作可参与调度（冷却只针对模型）",
+    h.accounts_available === 2, "accounts_available=" + h.accounts_available);
+
+  // /v1/status 需要 API_KEY，才有账号明细
+  const st = await (await worker.fetch(new Request("https://x.dev/v1/status", { headers: AUTH }), env5)).json();
+  check("status 报告的账号数正确（两账号）", st.account_count === 2, "account_count=" + st.account_count);
+  const first = (st.account_details || [])[0] || {};
+  check("账号明细带「账号×模型」级冷却列表",
+    Array.isArray(first.cooldown_models) && first.cooldown_models.length === 1,
+    "cooldown_models=" + JSON.stringify(first.cooldown_models));
+  check("冷却条目里有模型 ID（能看出是哪个模型受限）",
+    first.cooldown_models && first.cooldown_models[0].model_id === "cline-free/deepseek-v4.1-flash",
+    "model_id=" + (first.cooldown_models && first.cooldown_models[0].model_id));
+  check("冷却原因来自上游解析（free_daily，不是 unknown）",
+    first.cooldown_models && first.cooldown_models[0].kind === "free_daily",
+    "kind=" + (first.cooldown_models && first.cooldown_models[0].kind));
 
   // 冷却期内再请求：应直接返回 429 + Retry-After，不再打上游
   const before = upstreamCalls.length;
@@ -310,6 +444,25 @@ console.log("\n【5】429 限流：冷却切号、不空转");
     "status=" + r2.status + " reason=" + (b2.error && b2.error.reason));
   check("带 Retry-After 头供客户端退避", !!r2.headers.get("Retry-After"),
     "Retry-After=" + r2.headers.get("Retry-After"));
+  check("错误信息点明是哪个模型的额度用尽",
+    b2.error.model === "cline-free/deepseek-v4.1-flash",
+    "model=" + b2.error.model);
+
+  // 同账号的**另一个模型**不该被这个模型的冷却拖累 —— 这是本次改动的核心价值
+  setMode({ kind: "ok" });
+  const beforeOther = upstreamCalls.length;
+  // 用 stream:true —— 假上游只会回 SSE，非流式会走聚合分支，测不出这条路径
+  const r3 = await worker.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json", ...AUTH },
+    body: JSON.stringify({ model: "z-ai/glm-5.3-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env5);
+  await r3.text();
+  check("同账号的其它模型不受影响（账号×模型级冷却）",
+    r3.status === 200 && upstreamCalls.length === beforeOther + 1,
+    "status=" + r3.status + " 上游调用=" + (upstreamCalls.length - beforeOther));
+  check("上游收到的模型确实是 glm（不是被 deepseek 的冷却顶掉）",
+    upstreamCalls.length && upstreamCalls[upstreamCalls.length - 1].body.model === "z-ai/glm-5.3-flash",
+    "实际 model=" + (upstreamCalls.length && upstreamCalls[upstreamCalls.length - 1].body.model));
 }
 
 // =====================================================================
@@ -372,57 +525,197 @@ console.log("\n【8】上游请求体处理");
 }
 
 // =====================================================================
-console.log("\n【9】/v1/models 白名单过滤（只放行确定免费的模型）");
+console.log("\n【9】/v1/models 只回已启用模型（发现过滤器，非访问控制）");
 {
   setMode({ kind: "ok" });
-  const r = await req("/v1/models");
-  const d = await r.json();
-  const ids = d.data.map((m) => m.id);
+
+  // 全新实例（没启用过任何模型）→ 回退到内置推荐。
+  // 这条回退是必需的：否则新装的人会拿到一个空模型列表，客户端会以为服务坏了。
+  let d = await (await req("/v1/models")).json();
+  let ids = d.data.map((m) => m.id);
   check("返回 object=list", d.object === "list");
-  check("每个模型都带 cost 字段", d.data.length > 0 && d.data.every((m) => typeof m.cost === "string"),
-    "样例: " + JSON.stringify(d.data[0]));
-  check("每个模型都带 free 布尔字段", d.data.every((m) => typeof m.free === "boolean"));
-  check("列表内全部标为免费（白名单语义）",
-    d.data.every((m) => m.cost === "free" && m.free === true),
-    "不应出现非 free 项: " + JSON.stringify(d.data.filter((m) => m.cost !== "free")));
-  check(":free 后缀的模型放行",
-    ids.includes("nvidia/nemotron-3-super-120b-a12b:free"), "缺 :free 后缀模型");
-  check("白名单里实测免费的模型放行（名字无 :free 也要进）",
-    ids.includes("deepseek/deepseek-v4-flash"), "白名单模型被挡掉了");
-  check("非白名单的普通模型被挡掉",
-    !ids.includes("openai/gpt-6-astra") && !ids.includes("unknown-vendor/mystery-model"),
-    "不应放行: " + ids.join(", "));
-  check("即便官方 recommended 分类也不放行（只认白名单与 :free）",
-    !ids.includes("openai/gpt-6-astra"), "openai/gpt-6-astra 不该出现");
-  check("需订阅的 cline-pass 模型被挡掉", !ids.includes("cline-pass/glm-5.2"));
-  check(":batch 通道被排除（即便带 :free 后缀）",
-    !d.data.some((m) => m.id.includes(":batch")),
-    ":batch 应被排除");
-  check("~ 别名去波浪号后按白名单判定，命中则保留",
-    ids.includes("deepseek/deepseek-v4-flash-0731") && !ids.some((i) => i.startsWith("~")),
-    "~deepseek/deepseek-v4-flash-0731 应变成不带波浪号的 ID");
-  check("~ 别名未命中白名单则丢弃", !ids.includes("openai/gpt-latest"));
-  check("别名保留原始 ID 到 upstream 字段（便于排查）",
-    d.data.some((m) => m.upstream === "~deepseek/deepseek-v4-flash-0731" && m.id === "deepseek/deepseek-v4-flash-0731"));
-  check("模型不重复（~ 别名与本体同名时去重）", ids.length === new Set(ids).size,
-    "发现重复 ID: " + ids.filter((x, i) => ids.indexOf(x) !== i).join(", "));
-  check("官方 free 分类 → channel=free",
-    d.data.some((m) => m.channel === "free" && m.id === "z-ai/glm-5.3-flash"),
-    "应有 channel=free 的模型");
-  check("官方分类未覆盖但在白名单里 → channel=verified",
-    d.data.some((m) => m.channel === "verified" && m.id === "deepseek/deepseek-v4-flash"),
-    "白名单独有项应标 verified");
-  check("仅靠 :free 后缀进来的 → channel=free-suffix",
-    d.data.some((m) => m.channel === "free-suffix" && m.id.endsWith(":free")),
-    "应有一条 free-suffix 来源的模型");
-  check("每个模型都带 channel 字段（渠道来源可溯源）",
-    d.data.every((m) => "channel" in m), "缺 channel 字段");
-  // cline-free/* 不在 /v1/models 里，只存在于 recommended-models 的 free 数组，
-  // 必须补入模型池——否则默认模型自己会从列表里消失
-  check("free 数组独有模型（cline-free/*）被补入模型池",
-    ids.includes("cline-free/deepseek-v4.1-flash") && ids.includes("cline-free/muse-spark-1.3-contributor"),
-    "缺 cline-free 官方免费通道: " + ids.join(", "));
-  check("补入的模型也标 free", d.data.filter((m) => m.id.startsWith("cline-free/")).every((m) => m.free === true));
+  check("没启用过任何模型时回退到内置推荐（不是空列表）", ids.length > 0, "返回了空列表");
+  check("回退列表里含默认模型", ids.includes("cline-free/deepseek-v4.1-flash"),
+    "缺默认模型: " + ids.join(", "));
+  check("每个模型带 is_default 标记（且只有一个）",
+    d.data.filter((m) => m.is_default).length === 1,
+    JSON.stringify(d.data.map((m) => [m.id, m.is_default])));
+  check("owned_by 取自模型 ID 的前缀", d.data.every((m) => m.owned_by && !m.owned_by.includes("/")),
+    JSON.stringify(d.data.map((m) => m.owned_by)));
+
+  // 启用两个模型 → 列表以用户的选择为准（不再回退）
+  const add = await (await post("/v1/models/batch", { ids: ["openai/gpt-6-astra", "cline-pass/glm-5.2"] }, AUTH)).json();
+  check("批量添加返回 added/skipped/failed 三分类",
+    Array.isArray(add.added) && Array.isArray(add.skipped) && !!add.failed,
+    JSON.stringify(Object.keys(add)));
+  check("两个模型都被添加", add.added.length === 2, JSON.stringify(add));
+  d = await (await req("/v1/models")).json();
+  ids = d.data.map((m) => m.id);
+  check("启用后 /v1/models 以用户的选择为准（不再回退内置）",
+    ids.length === 2 && ids.includes("openai/gpt-6-astra") && ids.includes("cline-pass/glm-5.2"),
+    "实际: " + ids.join(", "));
+  check("内置推荐模型已从列表消失（用户的选择说了算）",
+    !ids.includes("cline-free/deepseek-v4.1-flash"), "内置推荐不该还在: " + ids.join(", "));
+
+  // 重复添加计入 skipped 而不是报错 —— 这样「全部添加」可以安全地重复点
+  const again = await (await post("/v1/models/batch", { ids: ["openai/gpt-6-astra"] }, AUTH)).json();
+  check("重复添加计入 skipped 而不是报错",
+    again.added.length === 0 && again.skipped.length === 1, JSON.stringify(again));
+  check("重复添加后列表不变", (await (await req("/v1/models")).json()).data.length === 2);
+
+  // 非法 ID 被挡（这些字符会破坏下游字符串语法）。
+  // 同一批里的合法项要照常加入 —— 一条坏 ID 不该让整批失败。
+  const bad = await (await post("/v1/models/batch", { ids: ["ok/model", "bad|id", "quote\"id"] }, AUTH)).json();
+  check("非法模型 ID 被拒绝且说明原因",
+    Object.keys(bad.failed).length === 2 && bad.added.length === 1, JSON.stringify(bad));
+  check("非法 ID 的报错说清是哪些字符",
+    Object.values(bad.failed)[0].includes("非法字符"), Object.values(bad.failed)[0]);
+  check("一批里的合法项照常加入（坏 ID 不拖累整批）",
+    bad.added[0] === "ok/model", JSON.stringify(bad.added));
+  // 把这一批加的 ok/model 清掉，后面的用例要按"干净状态"来断言
+  await post("/v1/models/delete", { id: "ok/model" }, AUTH);
+
+  // 设默认模型
+  const notEnabled = await post("/v1/models/default", { id: "not/enabled" }, AUTH);
+  check("未启用的模型不能设为默认（400）", notEnabled.status === 400, "status=" + notEnabled.status);
+  const setOk = await (await post("/v1/models/default", { id: "openai/gpt-6-astra" }, AUTH)).json();
+  check("已启用的模型可设为默认", setOk.default_model === "openai/gpt-6-astra", JSON.stringify(setOk.default_model));
+  d = await (await req("/v1/models")).json();
+  check("is_default 跟着转移",
+    d.data.filter((m) => m.is_default).map((m) => m.id).join() === "openai/gpt-6-astra",
+    JSON.stringify(d.data.map((m) => [m.id, m.is_default])));
+
+  // 删掉默认模型 → 默认值必须回退，否则不带 model 的请求会打到已撤下的模型上
+  const del = await (await post("/v1/models/delete", { id: "openai/gpt-6-astra" }, AUTH)).json();
+  check("删除默认模型后默认值自动回退到剩余的第一个",
+    del.default_model === "cline-pass/glm-5.2", "default=" + del.default_model);
+  check("删除后列表里只剩另一个", del.models.length === 1);
+
+  // 关键语义：启用的模型只是"给客户端看什么"，不是访问控制。
+  // 写死模型 ID 的客户端不该因为没在面板里点过就失败。
+  const unlisted = await req("/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...AUTH },
+    body: JSON.stringify({ model: "some/unlisted-model", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  });
+  check("未启用的模型仍可调用（发现过滤器 ≠ 访问控制）", unlisted.status === 200, "status=" + unlisted.status);
+  await unlisted.text();
+
+  // 清空启用列表 → 回到回退状态
+  await post("/v1/models/delete", { id: "cline-pass/glm-5.2" }, AUTH);
+  const en = await (await req("/v1/models/enabled", { headers: AUTH })).json();
+  check("清空后回到「未启用」状态并标记 using_builtin",
+    en.using_builtin === true && en.models.length > 0,
+    JSON.stringify({ b: en.using_builtin, n: en.models.length }));
+  d = await (await req("/v1/models")).json();
+  check("清空后 /v1/models 又回退到内置推荐", d.data.length > 0, "返回了空列表");
+
+  // 鉴权与非法参数
+  const noAuthBatch = await req("/v1/models/batch", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ids: ["a/b"] }),
+  });
+  check("模型批量添加未鉴权时拒绝（401）", noAuthBatch.status === 401, "status=" + noAuthBatch.status);
+  const emptyIds = await post("/v1/models/batch", { ids: [] }, AUTH);
+  check("ids 为空时报 400", emptyIds.status === 400, "status=" + emptyIds.status);
+}
+
+// =====================================================================
+console.log("\n【9b】模型库：推荐分组 / 全部模型 / 可用性检测");
+{
+  setMode({ kind: "ok" });
+
+  // 推荐分组：面板一打开就拉，所以要走缓存、不能每次回源
+  const lib = await (await req("/v1/models/library", { headers: AUTH })).json();
+  check("推荐清单按官方四个分类分组且顺序固定",
+    lib.groups.map((g) => g.key).join() === "recommended,free,clinePass,clineCloud",
+    JSON.stringify(lib.groups.map((g) => g.key)));
+  check("分组带展示用的 meta（标题/说明/颜色）",
+    lib.groups.every((g) => g.meta && g.meta.title), JSON.stringify((lib.groups[0] || {}).meta));
+  check("模型带 name / description / tags（面板要显示）",
+    lib.groups.some((g) => g.models.some((m) => m.name && m.description && Array.isArray(m.tags))),
+    JSON.stringify(lib.groups[0].models[0]));
+  // 缓存语义：首次回源、再次命中。面板每次进模型页都会拉这个接口，
+  // 每次都回源会把上游的配额和面板的首屏速度一起拖垮。
+  const lib2 = await (await req("/v1/models/library", { headers: AUTH })).json();
+  check("推荐分组二次请求命中缓存（不回源）", lib2.cached === true, "cached=" + lib2.cached);
+
+  // 全部模型：446 条那种大清单，只在展开折叠块时拉
+  const cat = await (await req("/v1/models/catalog", { headers: AUTH })).json();
+  check("全部模型按供应商前缀分组", cat.groups.length > 0 && cat.groups.every((g) => !g.key.includes("/")),
+    JSON.stringify(cat.groups.map((g) => g.key)));
+  check("全部模型带 context_length（面板显示上下文）",
+    cat.groups.some((g) => g.models.some((m) => m.context_length > 0)),
+    JSON.stringify(cat.groups[0] && cat.groups[0].models[0]));
+  check("~ 前缀归到同一供应商组（但不改 ID 本身）",
+    cat.groups.some((g) => g.key === "deepseek" && g.models.some((m) => m.id.startsWith("~deepseek/"))),
+    JSON.stringify(cat.groups.map((g) => [g.key, g.models.length])));
+  check("~ 前缀的 ID 原样保留（它是 ID 的一部分，不是别名标记）",
+    cat.groups.some((g) => g.models.some((m) => m.id === "~deepseek/deepseek-pro-latest")),
+    "波浪号被错误剥掉了");
+
+  // 回源失败 → 退回过期缓存而不是让面板空白
+  setMode({ kind: "ok", models: "fail" });
+  const stale = await (await req("/v1/models/library?refresh=1", { headers: AUTH })).json();
+  check("上游抓取失败时退回过期缓存（并标记 stale）",
+    stale.stale === true && stale.groups.length > 0,
+    JSON.stringify({ stale: stale.stale, n: stale.groups.length, err: stale.error }));
+  check("stale 响应里带失败原因（面板要提示用户）", !!stale.error, "err=" + stale.error);
+  setMode({ kind: "ok" });
+
+  // 模型检测：异步任务，只回答"现在能不能用"
+  const startResp = await req("/v1/models/check", {
+    method: "POST", headers: { "Content-Type": "application/json", ...AUTH },
+    body: JSON.stringify({ id: "deepseek/deepseek-v4-flash" }),
+  });
+  const started = await startResp.json();
+  check("检测立即返回 202 + jobId（不阻塞面板）",
+    startResp.status === 202 && started.job && started.job.id, "status=" + startResp.status);
+  check("检测任务的 kind 与渠道探测区分开",
+    started.job.kind === "check", "kind=" + started.job.kind);
+
+  const waitJob = async (id) => {
+    let job = { id, status: "running" };
+    for (let i = 0; i < 40 && job.status === "running"; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      job = (await (await req("/v1/models/check?jobId=" + encodeURIComponent(id), { headers: AUTH })).json()).job;
+    }
+    return job;
+  };
+
+  const job = await waitJob(started.job.id);
+  check("检测跑完并给出可用结论", job.status === "done" && job.result && job.result.ok === true,
+    JSON.stringify({ s: job.status, r: job.result }));
+  check("检测结果带耗时（面板显示首字节）",
+    typeof job.result.latencyMs === "number", JSON.stringify(job.result));
+
+  // 200 但正文为空 = 实际不可用。只认状态码会把这种情况误报成"可用"。
+  setMode({ kind: "empty" });
+  const e1 = await (await req("/v1/models/check", {
+    method: "POST", headers: { "Content-Type": "application/json", ...AUTH },
+    body: JSON.stringify({ id: "deepseek/deepseek-v4-flash" }),
+  })).json();
+  const j2 = await waitJob(e1.job.id);
+  check("HTTP 200 但正文为空 → 判为不可用（不能只看状态码）",
+    j2.result && j2.result.ok === false, JSON.stringify(j2.result));
+  check("空正文的说明解释了可能原因", j2.result.text.includes("有效文本"), j2.result.text);
+
+  // 状态码 → 人能看懂、且能照着做的原因
+  setMode({ kind: "code", status: 402, body: { error: { message: "need credits" } } });
+  const e2 = await (await req("/v1/models/check", {
+    method: "POST", headers: { "Content-Type": "application/json", ...AUTH },
+    body: JSON.stringify({ id: "deepseek/deepseek-v4-flash" }),
+  })).json();
+  const j3 = await waitJob(e2.job.id);
+  check("402 → 提示额度/订阅不足（而不是把 HTTP 码丢给用户）",
+    j3.result.text.includes("额度"), j3.result.text);
+  setMode({ kind: "ok" });
+
+  const badJob = await req("/v1/models/check?jobId=nope", { headers: AUTH });
+  check("未知 jobId 返回 404 且提示重新检测", badJob.status === 404, "status=" + badJob.status);
+  const noId = await post("/v1/models/check", {}, AUTH);
+  check("检测缺 id 时报 400", noId.status === 400, "status=" + noId.status);
+  const noAuth = await req("/v1/models/library");
+  check("模型库接口未鉴权时拒绝（401）", noAuth.status === 401, "status=" + noAuth.status);
 }
 
 // =====================================================================
@@ -442,16 +735,18 @@ console.log("\n【10】控制台页面完整性");
   for (const [name, needle] of [
     ["多轮对话容器", 'id="thread"'],
     ["停止生成按钮", 'id="btnStop"'],
-    ["模型筛选输入框", 'id="mfilter"'],
-    ["只看免费开关", 'id="mfree"'],
     ["接入代码片段区", 'id="snip"'],
     ["固定高度日志滚动窗口", 'id="logwin"'],
     ["日志详情面板", 'id="logDetail"'],
     ["日志筛选开关", 'data-f="slow"'],
     ["账号池指示器（签名元素）", 'id="poolCells"'],
-    ["输出速度列", 'data-s="speed"'],
-    ["首字节列", 'data-s="ttft"'],
     ["思考过程折叠", 'details class="rz"'],
+    // 模型库三段式（对齐 Go 版 cline-proxy 的布局）
+    ["模型推荐分组容器", 'id="mLibrary"'],
+    ["全部模型折叠块", 'id="mCatalogFold"'],
+    ["全部模型搜索框", 'id="mCatSearch"'],
+    ["已启用模型列表", 'id="mOwned"'],
+    ["模型描述开关", 'id="mDescBtn"'],
   ]) {
     check("含" + name, html.includes(needle), "缺少: " + needle);
   }
@@ -474,7 +769,8 @@ console.log("\n【10】控制台页面完整性");
   check("像素 WiFi 图标为内联 SVG（1px 网格 rect）",
     /<svg class="logo"[^>]*><rect /.test(html), "品牌区应有像素 WiFi 的 SVG");
   check("国产模型识别表存在", html.includes("CN_PROVIDERS") && html.includes("deepseek"));
-  check("国产优先排序逻辑存在", html.includes('s==="region"') || html.includes('mcn'));
+  check("模型按供应商分组渲染（全部模型视图）", html.includes("groupCatalogModels") || html.includes("function modelGroupHTML"),
+    "模型页应有供应商分组逻辑");
   check("日志为固定高度滚动窗口", html.includes('id="logwin"') && /overflow-y:\s*auto/.test(html));
   check("日志含跟随最新开关", html.includes('id="btnFollow"'));
   check("日志含详情面板", html.includes('id="logDetail"'));
@@ -521,26 +817,44 @@ console.log("\n【10】控制台页面完整性");
 }
 
 // =====================================================================
-console.log("\n【11】/v1/health 账号池明细（控制台签名元素的数据源）");
+console.log("\n【11】账号明细：health 精简 + status 带鉴权（避免公开泄露邮箱）");
 {
   const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_Z_zzzzzzzzzz\nTOKEN_Y_yyyyyyyyyy" };
   const h = await (await worker.fetch(new Request("https://x.dev/v1/health"), env)).json();
-  check("返回 account_details 数组", Array.isArray(h.account_details), JSON.stringify(h.account_details));
-  check("每项含 index / available / cooldown_seconds / token_cached",
-    h.account_details.every((a) =>
+
+  // health 免鉴权 → 不该带账号明细（邮箱、用量都在这端点暴露给公网）
+  check("health 不再下发 account_details（免鉴权端点不泄露账号信息）",
+    h.account_details === undefined, JSON.stringify(h.account_details));
+  check("health 不泄露邮箱字段", !JSON.stringify(h).includes("email"),
+    "health 响应里出现了 email");
+  check("health 仍保留连通性所需的计数字段",
+    typeof h.account_count === "number" && typeof h.accounts_available === "number" &&
+    typeof h.api_key_configured === "boolean",
+    JSON.stringify({ count: h.account_count, avail: h.accounts_available }));
+
+  // 明细改到需要 API_KEY 的 /v1/status
+  const st = await (await worker.fetch(new Request("https://x.dev/v1/status", { headers: AUTH }), env)).json();
+  check("status 返回 account_details 数组", Array.isArray(st.account_details), JSON.stringify(st.account_details));
+  check("每项含 index / available / cooldown_models / token_cached",
+    st.account_details.every((a) =>
       typeof a.index === "number" && typeof a.available === "boolean" &&
-      typeof a.cooldown_seconds === "number" && typeof a.token_cached === "boolean"),
-    JSON.stringify(h.account_details[0]));
+      Array.isArray(a.cooldown_models) && typeof a.token_cached === "boolean"),
+    JSON.stringify(st.account_details[0]));
+  check("status 同时返回全局冷却表（供控制台展示）",
+    Array.isArray(st.cooldowns), JSON.stringify(st.cooldowns));
+
+  const noAuth = await worker.fetch(new Request("https://x.dev/v1/status"), env);
+  check("status 未鉴权时拒绝（不能当新的泄露口）", noAuth.status === 401, "status=" + noAuth.status);
+
   check("account_details 不泄露 token 内容", await (async () => {
     // 用不可能出现在字段名/枚举值里的 token，避免误判
     const probe = "sEcReTtOkEnVaLuE12345";
     const e2 = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: probe + "_aaaaaaaaaa\n" + probe + "_bbbbbbbbbb" };
-    const h2 = await (await worker.fetch(new Request("https://x.dev/v1/health"), e2)).json();
-    const dump = JSON.stringify(h2);
-    return !dump.includes(probe);
-  })(), "健康端点里出现了 refreshToken 片段");
+    const st2 = await (await worker.fetch(new Request("https://x.dev/v1/status", { headers: AUTH }), e2)).json();
+    return !JSON.stringify(st2).includes(probe);
+  })(), "账号明细里出现了 refreshToken 片段");
   check("account_details 数量与 account_count 一致",
-    h.account_details.length === h.account_count);
+    st.account_details.length === st.account_count);
 }
 
 // =====================================================================
@@ -639,22 +953,26 @@ console.log("\n【13】登录流程（假 WorkOS 上游）");
   check("poll 返回 refreshToken", p2.refresh_token === "CLINE_RT_NEW_123456", p2.refresh_token);
   check("poll 返回邮箱", p2.email === "new@example.com", p2.email);
 
-  // 登录后账号应进入账号池并可被 health 看到（标记为 runtime）
+  // 登录后账号应进入账号池。明细在 /v1/status（需鉴权），health 只回计数。
   const h = await (await w2.fetch(new Request("https://x.dev/v1/health"), env)).json();
   check("登录的账号已进入账号池", h.account_count === 1, "account_count=" + h.account_count);
-  check("该账号被标记为运行时账号（重启会丢）",
-    h.runtime_accounts === 1 && h.account_details[0].runtime === true,
-    JSON.stringify(h.account_details));
-  check("health 不泄露登录得到的 refreshToken",
-    !JSON.stringify(h).includes("CLINE_RT_NEW"), "泄漏了 token");
+  check("登录返回里告知是否已落盘（本地为 true）",
+    p2.persisted === false, "persisted=" + p2.persisted + "（测试环境没有接持久化钩子）");
+
+  const st = await (await w2.fetch(new Request("https://x.dev/v1/status", { headers: AUTH }), env)).json();
+  check("该账号被标记为运行时账号（来自控制台登录）",
+    st.runtime_accounts === 1 && st.account_details[0].runtime === true,
+    JSON.stringify(st.account_details));
+  check("status 不泄露登录得到的 refreshToken",
+    !JSON.stringify(st).includes("CLINE_RT_NEW"), "泄漏了 token");
 
   const p3 = await (await call("/v1/login/poll", {})).json();
   check("poll 缺 device_code 时报错", !p3.ok, JSON.stringify(p3));
   check("poll 不泄露上游错误细节为成功", p3.status !== "success");
 
   // 运行时账号可以被移除（与环境变量账号相反：后者只能停用）
-  const h2 = await (await w2.fetch(new Request("https://x.dev/v1/health"), env)).json();
-  const rtId = h2.account_details[0].id;
+  const st2 = await (await w2.fetch(new Request("https://x.dev/v1/status", { headers: AUTH }), env)).json();
+  const rtId = st2.account_details[0].id;
   const rm = await (await call("/v1/accounts/action", { action: "remove", id: rtId })).json();
   check("运行时账号可以移除", rm.ok === true && rm.removed === 1,
     JSON.stringify(rm).slice(0, 160));
@@ -686,14 +1004,18 @@ console.log("\n【14】账号控制（启用/停用/重置冷却/移除）");
     body: JSON.stringify(body || {}),
   }), env);
   const health = async () => (await w.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  // 账号明细在 /v1/status（需鉴权）；health 只回计数
+  const status = async () => (await w.fetch(new Request("https://x.dev/v1/status", {
+    headers: { Authorization: "Bearer sk-test" },
+  }), env)).json();
   const chat = () => w.fetch(new Request("https://x.dev/v1/chat/completions", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
     body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
   }), env);
 
-  let h = await health();
-  check("health 的账号明细含 id / enabled / stats",
+  let h = await status();
+  check("账号明细含 id / enabled / stats",
     h.account_details.every((a) => typeof a.id === "string" && a.id.length > 0 &&
       typeof a.enabled === "boolean" && a.stats && typeof a.stats.ok === "number"),
     JSON.stringify(h.account_details[0]));
@@ -716,10 +1038,12 @@ console.log("\n【14】账号控制（启用/停用/重置冷却/移除）");
     r.accounts[0].enabled === false && r.accounts[0].available === false,
     JSON.stringify(r.accounts[0]));
   check("停用只影响目标账号", r.accounts[1].enabled === true);
-  check("停用后 accounts_available 少一个", r.accounts.filter((a) => a.available).length === 1);
+  check("停用后可用账号少一个（available 反映是否参与调度）",
+    r.accounts.filter((a) => a.available).length === 1,
+    JSON.stringify(r.accounts.map((a) => a.available)));
 
-  h = await health();
-  check("health 反映停用状态",
+  h = await status();
+  check("status 反映停用状态",
     h.account_details[0].enabled === false && h.accounts_available === 1,
     JSON.stringify({ enabled: h.account_details[0].enabled, avail: h.accounts_available }));
 
@@ -763,13 +1087,13 @@ console.log("\n【14】账号控制（启用/停用/重置冷却/移除）");
 
   // 统计：成功调用应累计到账号上
   await chat();
-  h = await health();
+  h = await status();
   check("成功请求累加到账号统计（ok>0）",
     h.account_details.some((a) => a.stats.ok > 0),
     JSON.stringify(h.account_details.map((a) => a.stats)));
 
   // token 刷新轮换后，账号 id 必须保持不变，否则控制台的开关会跟丢账号
-  const afterRefresh = await health();
+  const afterRefresh = await status();
   check("账号 id 在 token 轮换后保持稳定",
     afterRefresh.account_details[0].id === idA,
     "before=" + idA + " after=" + afterRefresh.account_details[0].id);
@@ -812,8 +1136,13 @@ console.log("\n【15】Token 用量统计");
     JSON.stringify(h.usage.total));
   check("usage.days 已铺满 30 天（横轴连续）", h.usage.days.length === 30,
     "days=" + h.usage.days.length);
-  check("账号明细含 usage 字段",
-    h.account_details.every((a) => a.usage && typeof a.usage.total === "number"));
+  {
+    const st0 = await (await w.fetch(new Request("https://x.dev/v1/status",
+      { headers: { Authorization: "Bearer sk-test" } }), env)).json();
+    check("账号明细含 usage 字段",
+      st0.account_details.every((a) => a.usage && typeof a.usage.total === "number"),
+      JSON.stringify(st0.account_details.map((a) => a.usage)));
+  }
 
   // ── 流式：usage 从收尾 chunk 里取（假上游给的是 5 prompt / 5 completion）──
   const beforeCalls = (await health()).usage.total.calls;
@@ -835,9 +1164,13 @@ console.log("\n【15】Token 用量统计");
     JSON.stringify(h.usage.by_model));
   check("usage 按账号分组", (h.usage.by_account || []).length === 1,
     JSON.stringify(h.usage.by_account));
-  check("账号卡上的 token 数跟着累加",
-    h.account_details.some((a) => a.usage.input === 5 && a.usage.output === 5),
-    JSON.stringify(h.account_details.map((a) => a.usage)));
+  {
+    const stU = await (await w.fetch(new Request("https://x.dev/v1/status",
+      { headers: { Authorization: "Bearer sk-test" } }), env)).json();
+    check("账号卡上的 token 数跟着累加",
+      stU.account_details.some((a) => a.usage.input === 5 && a.usage.output === 5),
+      JSON.stringify(stU.account_details.map((a) => a.usage)));
+  }
   check("今日用量进入 days 的最后一格",
     h.usage.days[29].total === 10 && h.usage.days[29].calls === 1,
     JSON.stringify(h.usage.days[29]));
@@ -929,12 +1262,551 @@ console.log("\n【15】Token 用量统计");
     okRestore === true && h2.usage.total.total === snapTotal && h2.usage.client_requests === flushed.clientRequests,
     "期望 total=" + snapTotal + "，实际 " + h2.usage.total.total +
     "；clientRequests 期望 " + flushed.clientRequests + "，实际 " + h2.usage.client_requests);
-  check("恢复后账号卡上的 token 数不归零",
-    h2.account_details.some((a) => a.usage.total > 0),
-    JSON.stringify(h2.account_details.map((a) => a.usage)));
+  {
+    const st2 = await (await w2.fetch(new Request("https://x.dev/v1/status",
+      { headers: { Authorization: "Bearer sk-test" } }), env)).json();
+    check("恢复后账号卡上的 token 数不归零",
+      st2.account_details.some((a) => a.usage.total > 0),
+      JSON.stringify(st2.account_details.map((a) => a.usage)));
+  }
   check("恢复后重试放大倍数一致",
     Math.abs(h2.usage.retry_amplification - (flushed.total.calls / flushed.clientRequests)) < 0.02,
     "amp=" + h2.usage.retry_amplification);
+}
+
+// =====================================================================
+console.log("\n【16】上游渠道钉住（planner / direct 双管道）");
+{
+  // 独立实例：上游配置是模块级状态，混进前面的用例会互相污染
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "pin-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+  const lastBody = () => upstreamCalls[upstreamCalls.length - 1].body;
+  // 偏好注入位置取决于管道：planner 走 providerOptions.gateway，
+  // direct 走顶层 provider；管道未知时两处都有。断言只看「实际生效的那一处」。
+  const pipePrefs = () => {
+    const b = lastBody();
+    return (b.providerOptions && b.providerOptions.gateway) || b.provider || {};
+  };
+
+  const savePin = (cfg) => w.fetch(new Request("https://x.dev/v1/upstreams?action=save", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model_id: "cline-free/deepseek-v4.1-flash", config: cfg }),
+  }), env);
+  const chat = (model) => w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model: model || "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+
+  setMode({ kind: "ok" });
+
+  // 管道未知时两种形式同时注入：实测 planner 模型上多一个顶层 provider.only
+  // 不会报错（顶层被网关忽略），所以这是安全的兜底，省掉「必须先探测」的强依赖。
+  await savePin({ upstreams: ["alibaba", "deepinfra"], pinMode: "strict" });
+  await (await chat()).text();
+  check("管道未知时同时注入两种形式（direct 的 provider + planner 的 providerOptions）",
+    !!lastBody().provider && !!lastBody().providerOptions && !!lastBody().providerOptions.gateway,
+    JSON.stringify({ provider: lastBody().provider, po: lastBody().providerOptions }));
+  check("strict 模式：钉住的渠道写进 only",
+    JSON.stringify(lastBody().provider.only) === JSON.stringify(["alibaba", "deepinfra"]),
+    JSON.stringify(lastBody().provider));
+
+  // preferred 模式写 order（首位优先、其余回退）
+  await savePin({ upstreams: ["alibaba", "deepinfra"], pinMode: "preferred" });
+  await (await chat()).text();
+  check("preferred 模式：写 order 而不是 only",
+    JSON.stringify(lastBody().provider.order) === JSON.stringify(["alibaba", "deepinfra"]) &&
+    lastBody().provider.only === undefined,
+    JSON.stringify(lastBody().provider));
+
+  // 排除项换算成 only 白名单（网关不认 exclude 字段，实测被静默忽略）。
+  // 白名单需要**已知渠道清单**，而清单只能靠探测得到——所以先跑一次真实探测，
+  // 这也顺带验证「探测结果被写回配置、供后续保存复用」。
+  setMode({ kind: "routing", pipeline: "planner", provider: "alibaba" });
+  const pjob = await (await w.fetch(new Request("https://x.dev/v1/upstreams?action=probe", {
+    method: "POST", headers: A, body: JSON.stringify({ model_id: "cline-free/deepseek-v4.1-flash" }),
+  }), env)).json();
+  let pj = pjob.job;
+  for (let i = 0; i < 40 && pj.status === "running"; i++) {
+    await new Promise((r) => setTimeout(r, 150));
+    pj = (await (await w.fetch(new Request(
+      "https://x.dev/v1/upstreams?action=probe_status&jobId=" + encodeURIComponent(pj.id), { headers: A }), env)).json()).job;
+  }
+  check("planner 管道被识别（从 provider_metadata.gateway.routing 回读）",
+    pj.result && pj.result.pipeline === "planner",
+    "pipeline=" + (pj.result && pj.result.pipeline) + " note=" + (pj.result && pj.result.note));
+  check("planner 管道下从错误文本枚举出渠道清单",
+    pj.result && JSON.stringify(pj.result.available) === JSON.stringify(["alibaba", "baseten", "deepinfra", "novita"]),
+    JSON.stringify(pj.result && pj.result.available));
+  check("探测确认钉住生效（实际命中与钉住列表一致）",
+    pj.result && pj.result.providerMatch === true,
+    "providerMatch=" + (pj.result && pj.result.providerMatch) + " provider=" + (pj.result && pj.result.provider));
+
+  await savePin({ upstreams: ["alibaba", "novita"], pinMode: "strict", exclude: ["novita"] });
+  await (await chat()).text();
+  // 管道已知是 planner → 只注入 gateway 形式（顶层 provider 会被网关忽略，不必再发）
+  check("探测出 planner 管道后，只注入 providerOptions.gateway 形式",
+    lastBody().provider === undefined && !!lastBody().providerOptions,
+    JSON.stringify({ provider: lastBody().provider, po: lastBody().providerOptions }));
+  check("排除项换算成白名单：被排除的渠道从 only 里消失",
+    JSON.stringify(lastBody().providerOptions.gateway.only) === JSON.stringify(["alibaba"]),
+    JSON.stringify(lastBody().providerOptions));
+
+  // 排除优先级高于勾选：pin 与 exclude 同时命中时排除赢
+  await savePin({
+    upstreams: ["alibaba", "novita"], exclude: ["novita", "alibaba"], pinMode: "strict",
+  });
+  await (await chat()).text();
+  check("排除优先于勾选（钉住的渠道也会被排除掉）",
+    JSON.stringify(lastBody().providerOptions.gateway.only) === JSON.stringify(["baseten", "deepinfra"]),
+    JSON.stringify(lastBody().providerOptions));
+
+  // 模型重定向：对外用稳定别名，上游改名时只改这里
+  await savePin({ redirect: "z-ai/glm-5.3-flash" });
+  await (await chat()).text();
+  check("模型重定向：发给上游的是重定向后的 ID",
+    lastBody().model === "z-ai/glm-5.3-flash", "model=" + lastBody().model);
+
+  // 别名：用别名请求也要命中同一条配置
+  await savePin({ upstreams: ["alibaba"], exclude: [], pinMode: "strict", aliases: ["my-glm"], redirect: "" });
+  await (await chat("my-glm")).text();
+  check("别名：用别名请求命中同一条配置",
+    JSON.stringify(pipePrefs().only) === JSON.stringify(["alibaba"]),
+    JSON.stringify(pipePrefs()));
+  check("别名请求不改写 model（只换配置，不动模型 ID）",
+    lastBody().model === "my-glm", "model=" + lastBody().model);
+
+  // 清空配置 → 回到自动模式（不注入任何偏好）
+  await savePin({ upstreams: [], exclude: [], redirect: "", aliases: [] });
+  await (await chat()).text();
+  check("清空配置后回到自动模式（不注入 provider/providerOptions）",
+    lastBody().provider === undefined && lastBody().providerOptions === undefined,
+    JSON.stringify({ provider: lastBody().provider, po: lastBody().providerOptions }));
+
+  // 客户端自己传的 providerOptions 必须被面板配置整体替换：
+  // 合并会让它的其它键（如 gateway.sort）存活并一起发往上游，实测会让上游 500
+  await savePin({ upstreams: ["alibaba"], pinMode: "strict" });
+  await w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify({
+      model: "cline-free/deepseek-v4.1-flash", stream: true,
+      messages: [{ role: "user", content: "hi" }],
+      providerOptions: { gateway: { sort: "evil", only: ["attacker"] } },
+    }),
+  }), env).then((r) => r.text());
+  check("客户端传的 providerOptions 被整体替换（不残留 sort 等键）",
+    lastBody().providerOptions.gateway.sort === undefined &&
+    JSON.stringify(lastBody().providerOptions.gateway.only) === JSON.stringify(["alibaba"]),
+    JSON.stringify(lastBody().providerOptions));
+
+  // 非法 slug 必须被挡掉，否则任意字符串会被注入请求体
+  await savePin({ upstreams: ["alibaba", "../../etc/passwd", "with space", "UPPER"], pinMode: "strict" });
+  await (await chat()).text();
+  check("非法渠道名被过滤（挡住请求体注入）",
+    JSON.stringify(pipePrefs().only) === JSON.stringify(["alibaba"]),
+    JSON.stringify(pipePrefs()));
+
+  // 列表接口
+  const list = await (await w.fetch(new Request("https://x.dev/v1/upstreams?action=list", { headers: A }), env)).json();
+  check("列表接口返回已配置项与可选模型", list.ok === true && Array.isArray(list.models),
+    JSON.stringify(Object.keys(list)));
+  check("列表里含刚保存的配置", list.upstreams.some((u) => u.model_id === "cline-free/deepseek-v4.1-flash"),
+    JSON.stringify(list.upstreams.map((u) => u.model_id)));
+
+  const del = await (await w.fetch(new Request("https://x.dev/v1/upstreams?action=delete", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model_id: "cline-free/deepseek-v4.1-flash" }),
+  }), env)).json();
+  check("删除配置返回成功", del.ok === true, JSON.stringify(del).slice(0, 140));
+  await (await chat()).text();
+  check("删除后不再注入偏好",
+    lastBody().provider === undefined && lastBody().providerOptions === undefined,
+    JSON.stringify({ p: lastBody().provider, po: lastBody().providerOptions }));
+
+  // provider 偏好不能丢：这些是上游识别「Cline 客户端」的指纹头
+  check("未配置钉住时请求头指纹仍完整",
+    upstreamCalls[upstreamCalls.length - 1].clientType === "cline-sdk",
+    "X-CLIENT-TYPE=" + upstreamCalls[upstreamCalls.length - 1].clientType);
+
+  const noAuth = await w.fetch(new Request("https://x.dev/v1/upstreams?action=list"), env);
+  check("上游配置接口未鉴权时拒绝", noAuth.status === 401, "status=" + noAuth.status);
+}
+
+// =====================================================================
+console.log("\n【17】上游探测（管道判定 + 渠道枚举 + 异步任务）");
+{
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "probe-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+
+  setMode({ kind: "ok" });
+
+  // 探测是异步的：立刻返回 jobId，避免同步等两次上游调用把页面拖到超时
+  const startResp = await w.fetch(new Request("https://x.dev/v1/upstreams?action=probe", {
+    method: "POST", headers: A, body: JSON.stringify({ model_id: "cline-free/deepseek-v4.1-flash" }),
+  }), env);
+  const started = await startResp.json();
+  check("探测立即返回 202 + jobId（不阻塞）",
+    startResp.status === 202 && started.ok === true && !!started.job.id,
+    "status=" + startResp.status + " job=" + JSON.stringify(started.job || null).slice(0, 120));
+  check("初始状态是 running", started.job.status === "running", started.job.status);
+
+  // 同一个模型重复点击：共享同一个任务，不重复消耗额度
+  const start2 = await (await w.fetch(new Request("https://x.dev/v1/upstreams?action=probe", {
+    method: "POST", headers: A, body: JSON.stringify({ model_id: "cline-free/deepseek-v4.1-flash" }),
+  }), env)).json();
+  check("同一模型重复探测共享任务（不重复打上游）",
+    start2.shared === true && start2.job.id === started.job.id,
+    "shared=" + start2.shared + " sameJob=" + (start2.job.id === started.job.id));
+
+  // 轮询直到完成
+  let job = started.job;
+  for (let i = 0; i < 40 && job.status === "running"; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    const s = await (await w.fetch(new Request(
+      "https://x.dev/v1/upstreams?action=probe_status&jobId=" + encodeURIComponent(job.id), { headers: A }), env)).json();
+    job = s.job;
+  }
+  check("探测任务最终完成", job && job.status === "done",
+    "status=" + (job && job.status) + " error=" + (job && job.error));
+
+  const res = (job && job.result) || {};
+  check("探测结果带管道字段（假上游无元数据 → 空字符串，但不报错）",
+    typeof res.pipeline === "string", "pipeline=" + JSON.stringify(res.pipeline));
+  check("探测结果带耗时（供用户判断该渠道快不快）",
+    typeof res.latencyMs === "number" && res.latencyMs >= 0, "latencyMs=" + res.latencyMs);
+  check("探测结果带可用渠道字段（即使为空数组）",
+    Array.isArray(res.available), JSON.stringify(res.available));
+  check("探测结果带 modelId / upstreamModel（能看出重定向）",
+    res.modelId === "cline-free/deepseek-v4.1-flash", JSON.stringify(res.modelId));
+
+  const badId = await w.fetch(new Request(
+    "https://x.dev/v1/upstreams?action=probe_status&jobId=nope", { headers: A }), env);
+  check("未知 jobId 返回 404（带可照做的提示）", badId.status === 404, "status=" + badId.status);
+
+  const noModel = await w.fetch(new Request("https://x.dev/v1/upstreams?action=probe", {
+    method: "POST", headers: A, body: JSON.stringify({}),
+  }), env);
+  check("探测缺 model_id 时报 400", noModel.status === 400, "status=" + noModel.status);
+
+  const noAuth = await w.fetch(new Request("https://x.dev/v1/upstreams?action=probe", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model_id: "x/y" }),
+  }), env);
+  check("探测端点未鉴权时拒绝", noAuth.status === 401, "status=" + noAuth.status);
+}
+
+// =====================================================================
+console.log("\n【18】设置：策略 / 冷却时长 / system 覆盖 / 请求头");
+{
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "cfg-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa\nTOKEN_B_bbbbbbbbbb" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+  const cfg = () => w.fetch(new Request("https://x.dev/v1/config", { headers: A }), env).then((r) => r.json());
+  const setCfg = (body) => w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify(body),
+  }), env).then((r) => r.json());
+  const lastBody = () => upstreamCalls[upstreamCalls.length - 1].body;
+  const chat = (extra) => w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify(Object.assign({ model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }, extra || {})),
+  }), env);
+
+  setMode({ kind: "ok" });
+
+  let c = await cfg();
+  check("配置端点返回策略与内置请求头",
+    c.ok === true && c.strategy === "round_robin" && Object.keys(c.default_headers).length > 0,
+    JSON.stringify({ strategy: c.strategy, hdrs: Object.keys(c.default_headers || {}).length }));
+  check("配置端点带 persisted 标记（前端据此提示能否存盘）",
+    typeof c.persisted === "boolean", "persisted=" + c.persisted);
+
+  // 非法策略必须被拒，且不能部分生效
+  const bad = await w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify({ strategy: "nonsense" }),
+  }), env);
+  check("非法轮换策略被拒绝（400）", bad.status === 400, "status=" + bad.status);
+  check("被拒后策略没变（校验先于修改）", (await cfg()).strategy === "round_robin");
+
+  // fill 策略：永远挑第一个可用账号
+  await setCfg({ strategy: "fill" });
+  check("策略可改为 fill", (await cfg()).strategy === "fill");
+  // 清掉 token 缓存，逼服务端每次都真的重新挑账号（否则两个账号可能共用
+  // 同一个缓存值，断言就成了假通过）
+  await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST", headers: A, body: JSON.stringify({ action: "resetAll" }),
+  }), env);
+  setMode({ kind: "ok" });
+  for (let i = 0; i < 3; i++) { await (await chat()).text(); }
+  check("fill 策略：三次请求都用同一个账号",
+    new Set(upstreamCalls.map((x) => x.auth)).size === 1,
+    "用到 " + new Set(upstreamCalls.map((x) => x.auth)).size + " 个账号");
+
+  // round_robin：两次请求应轮到两个账号
+  await setCfg({ strategy: "round_robin" });
+  // 先清 token 缓存：否则两个账号可能都持有同一个早已缓存的值，
+  // 看 Authorization 头就无法区分「用了不同账号」还是「同一账号被复用」。
+  await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST", headers: A, body: JSON.stringify({ action: "resetAll" }),
+  }), env);
+  setMode({ kind: "ok" });
+  for (let i = 0; i < 2; i++) { await (await chat()).text(); }
+  check("round_robin 策略：两次请求轮到不同账号",
+    new Set(upstreamCalls.map((x) => x.auth)).size === 2,
+    "用到 " + new Set(upstreamCalls.map((x) => x.auth)).size + " 个账号：" +
+    JSON.stringify(upstreamCalls.map((x) => x.auth)));
+
+  // 冷却时长：非法值被拒
+  const badCd = await w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify({ cooldown_minutes: 99999 }),
+  }), env);
+  check("冷却时长超范围被拒绝", badCd.status === 400, "status=" + badCd.status);
+  await setCfg({ cooldown_minutes: 45 });
+  check("冷却时长可设置（45 分钟）", (await cfg()).cooldown_minutes === 45,
+    "cooldown=" + (await cfg()).cooldown_minutes);
+
+  // system prompt 覆盖：替换客户端传来的 system，且位置保持在最前
+  await setCfg({ override_prompt: "只回答是或否" });
+  await (await chat({ messages: [{ role: "system", content: "客户端提示" }, { role: "user", content: "hi" }] })).text();
+  const msgs = lastBody().messages;
+  check("system 覆盖生效：内容被替换",
+    msgs[0].role === "system" && msgs[0].content === "只回答是或否",
+    JSON.stringify(msgs));
+  check("system 覆盖后只剩一条 system 消息（不重复）",
+    msgs.filter((m) => m.role === "system").length === 1, JSON.stringify(msgs));
+  check("非 system 消息原样保留", msgs[msgs.length - 1].content === "hi", JSON.stringify(msgs));
+
+  // 客户端不带 system 时，覆盖值也要放到最前（放后面会被当成普通上下文）
+  await (await chat({ messages: [{ role: "user", content: "hi" }] })).text();
+  check("客户端无 system 时，覆盖值插到最前面",
+    lastBody().messages[0].role === "system" && lastBody().messages[0].content === "只回答是或否",
+    JSON.stringify(lastBody().messages));
+
+  await setCfg({ override_prompt: "" });
+  await (await chat({ messages: [{ role: "system", content: "客户端提示" }, { role: "user", content: "hi" }] })).text();
+  check("清空覆盖后回到客户端自己的 system",
+    lastBody().messages[0].content === "客户端提示", JSON.stringify(lastBody().messages));
+
+  // 自定义请求头：覆盖内置指纹头
+  await setCfg({ headers: { "User-Agent": "Cline/9.9.9" }, replace_headers: true });
+  setMode({ kind: "ok" });
+  await (await chat()).text();
+  check("自定义请求头覆盖内置值（User-Agent 生效）",
+    upstreamCalls[upstreamCalls.length - 1].ua === "Cline/9.9.9",
+    "UA=" + upstreamCalls[upstreamCalls.length - 1].ua);
+  check("未覆盖的内置头仍在（指纹头不能因为覆盖而丢）",
+    upstreamCalls[upstreamCalls.length - 1].clientType === "cline-sdk",
+    "X-CLIENT-TYPE=" + upstreamCalls[upstreamCalls.length - 1].clientType);
+
+  // 请求头注入：名字与值里都不能有换行
+  const inj1 = await w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify({ headers: { "X-Bad\r\nX-Evil": "v" }, replace_headers: false }),
+  }), env);
+  check("请求头名含换行被拒绝（挡请求头注入）", inj1.status === 400, "status=" + inj1.status);
+  const inj2 = await w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify({ headers: { "X-Bad": "v\r\nX-Evil: 1" }, replace_headers: false }),
+  }), env);
+  check("请求头值含换行被拒绝", inj2.status === 400, "status=" + inj2.status);
+
+  await setCfg({ headers: {}, replace_headers: true });
+  check("请求头可整体清空（恢复默认）",
+    Object.keys((await cfg()).headers).length === 0,
+    JSON.stringify((await cfg()).headers));
+
+  // 默认模型：必须是**已启用**的模型（新规则，见 /v1/models 只回已启用模型）
+  const badModel = await w.fetch(new Request("https://x.dev/v1/config", {
+    method: "POST", headers: A, body: JSON.stringify({ default_model: "no/such-model" }),
+  }), env);
+  check("默认模型设为未启用的模型时被拒绝", badModel.status === 400, "status=" + badModel.status);
+  const badModelBody = await badModel.json();
+  check("拒绝时提示先去「模型」页添加它",
+    badModelBody.error.message.includes("模型"), badModelBody.error.message.slice(0, 120));
+
+  // 先启用再设默认
+  await w.fetch(new Request("https://x.dev/v1/models/batch", {
+    method: "POST", headers: A, body: JSON.stringify({ ids: ["z-ai/glm-5.3-flash"] }),
+  }), env);
+  await setCfg({ default_model: "z-ai/glm-5.3-flash" });
+  await (await chat({ model: undefined })).text();
+  check("默认模型生效（请求不带 model 时用它）",
+    lastBody().model === "z-ai/glm-5.3-flash", "model=" + lastBody().model);
+
+  const noAuth = await w.fetch(new Request("https://x.dev/v1/config"), env);
+  check("配置端点未鉴权时拒绝", noAuth.status === 401, "status=" + noAuth.status);
+}
+
+// =====================================================================
+console.log("\n【19】上游状态码映射（不能让客户端怀疑自己的 Key）");
+{
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "status-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+  const chat = () => w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+
+  // 上游 401/403 是**我们**的账号问题，不是客户端 API Key 的问题。
+  // 原样透传会让客户端以为自己的 Key 错了，跑去反复重配 —— 必须映射成 502。
+  for (const [up, want] of [[401, 502], [403, 502], [404, 404], [402, 402], [429, 429], [500, 502]]) {
+    // 429 会给账号打上冷却，污染后续用例（下一个请求会直接回 all_accounts_cooling
+    // 而不是打上游）。每个用例前清一次冷却，保证测的是状态码映射本身。
+    await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+      method: "POST", headers: A, body: JSON.stringify({ action: "resetAll" }),
+    }), env);
+    setMode({ kind: "code", status: up, body: { error: { message: "upstream said " + up } } });
+    const r = await chat();
+    const b = await r.json().catch(() => ({}));
+    check("上游 " + up + " → 客户端 " + want, r.status === want, "实际 " + r.status);
+    check("上游 " + up + " 的响应体带 upstream_status（便于排查）",
+      b.error && b.error.upstream_status === up, JSON.stringify(b.error || {}).slice(0, 120));
+  }
+
+  // 401/403 要给账号侧提示，而不是让用户怀疑自己的 Key
+  await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST", headers: A, body: JSON.stringify({ action: "resetAll" }),
+  }), env);
+  setMode({ kind: "code", status: 401, body: { error: { message: "unauthorized" } } });
+  const b401 = await (await chat()).json();
+  check("401 的提示指向账号凭据（重新登录），而不是客户端 Key",
+    b401.error.message.includes("重新登录"), b401.error.message.slice(0, 160));
+
+  await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST", headers: A, body: JSON.stringify({ action: "resetAll" }),
+  }), env);
+  setMode({ kind: "code", status: 403, body: { error: { message: "forbidden" } } });
+  const b403 = await (await chat()).json();
+  check("403 的提示指向风控/模型范围（可去探测）",
+    b403.error.message.includes("风控"), b403.error.message.slice(0, 160));
+
+  // 客户端自己的鉴权仍然走 401（不能和上游的 401 混为一谈）
+  const noAuth = await w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+  check("客户端未带 Key 时仍是 401（与上游 401 区分开）",
+    noAuth.status === 401, "status=" + noAuth.status);
+}
+
+// =====================================================================
+console.log("\n【20】流中途失败要发 error，而不是伪装成正常结束");
+{
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "stream-err-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+
+  // 上游先吐半句话，然后断开（不发 [DONE]）
+  setMode({ kind: "truncate" });
+  const r = await w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+  const openaiText = await r.text();
+  check("OpenAI 流中途断开时发出 error chunk（不是静默结束）",
+    openaiText.includes("upstream_error"), openaiText.slice(-260));
+  check("OpenAI 流中断时保留了已收到的内容",
+    openaiText.includes("半句话"), openaiText.slice(0, 200));
+
+  // Anthropic：中途失败要发 event: error，且**不能**再补一套正常收尾事件
+  // ——否则客户端会把被截断的回答当成模型主动结束（静默的错误数据比报错更危险）
+  setMode({ kind: "truncate" });
+  const ra = await w.fetch(new Request("https://x.dev/v1/messages", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+  const anthText = await ra.text();
+  check("Anthropic 流中途断开时发出 event: error",
+    anthText.includes("event: error"), anthText.slice(-260));
+  check("Anthropic 流中断时不再补 message_stop（不伪装成正常结束）",
+    !anthText.includes("event: message_stop"), anthText.slice(-300));
+}
+
+// =====================================================================
+console.log("\n【21】请求体上限与登录限流");
+{
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "limit-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa" };
+  const A = { "Content-Type": "application/json", Authorization: "Bearer sk-test" };
+
+  // 请求体上限：本地服务把整个 body 读进内存，没上限就能被一个超大 POST 打爆
+  const huge = "x".repeat((32 << 20) + 1024);
+  const bigResp = await w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: A,
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: huge }] }),
+  }), env);
+  check("超大请求体被拒绝（413，不是把内存吃光）", bigResp.status === 413, "status=" + bigResp.status);
+  const bigBody = await bigResp.json();
+  check("413 的提示说明上限值", bigBody.error && bigBody.error.type === "request_too_large",
+    JSON.stringify(bigBody.error || {}).slice(0, 160));
+
+  // 登录端点限流：未限流的话任何人都能拿它当 OAuth 中转站刷
+  setMode({ kind: "ok" });
+  const codes = [];
+  for (let i = 0; i < 12; i++) {
+    const r = await w.fetch(new Request("https://x.dev/v1/login/start", {
+      method: "POST", headers: A, body: "{}",
+    }), env);
+    codes.push(r.status);
+    await r.text();
+  }
+  check("登录端点有频率上限（超过后返回 429）", codes.includes(429),
+    "状态码序列: " + codes.join(","));
+  check("限流是「先放行若干次再拦」（不是一上来就 429）",
+    codes[0] !== 429 && codes[codes.length - 1] === 429,
+    "状态码序列: " + codes.join(","));
 }
 
 // ---------- 收尾 ----------
