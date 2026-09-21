@@ -216,10 +216,22 @@ curl https://cline-free.<你的子域>.workers.dev/v1/chat/completions \
 
 ### 本地运行（不部署也能用）⭐
 
-想先在本机验证 token 好不好使，不用部署：
+想先在本机验证 token 好不好使，不用部署。**推荐用启动脚本**，它会自动检查
+Node 版本、准备 `.env.local`、提示 token 是否填过，再拉起服务：
+
+| 系统 | 启动方式 |
+|---|---|
+| **Windows** | 双击 `start.bat`，或命令行运行 `start.bat` |
+| **Linux / macOS** | `./start.sh`（或 `bash start.sh`） |
+| **任意系统（通用）** | `node start.mjs` |
+
+> 💡 **Windows 用户直接双击 `start.bat` 就行**，不用先开终端。
+> 从双击启动时窗口不会一闪而过（脚本会等你按任意键）；从命令行启动则不阻塞。
+
+想手动控制等同于一回事：
 
 ```bash
-# 1. 准备配置（只需填 refreshToken）
+# 1. 准备配置（只需填 refreshToken；不建也行，服务会自己创建）
 cp .env.local.example .env.local
 #    在 .env.local 里填 CLINE_REFRESH_TOKEN=<你的 refreshToken>
 #    API_KEY 留空即可，启动时会自动生成并写回
@@ -233,6 +245,24 @@ node local-server.js
 node selftest.mjs
 ```
 
+#### 中文乱码？看这里
+
+Windows 控制台的默认代码页是 **936（GBK）**，而本项目的脚本和源码都是 **UTF-8**，
+所以**直接运行 `node local-server.js` 有可能看到中文乱码**。启动脚本已经处理好了
+（它们会先执行 `chcp 65001` 切到 UTF-8）；如果你坚持手动运行，遇到乱码就先切代码页：
+
+```bat
+chcp 65001
+node local-server.js
+```
+
+> ⚠️ **改 `start.bat` 时注意**：该文件必须是 **UTF-8 无 BOM + CRLF** 行尾，
+> 且 **`chcp 65001` 之前不能出现任何中文**——cmd.exe 是按「当前代码页」
+> 逐行解码批处理的，中文写在 `chcp` 之前会被错误解码、甚至把一行拆成两条命令报错。
+> 正因如此，`start.bat` 里只保留了纯 ASCII 的引导代码，**所有中文提示都放在
+> `start.mjs`** 里（Node 输出 UTF-8 不受代码页影响）。
+> 行尾要求已由 `.gitattributes` 固定，无需手动处理。
+
 `local-server.js` 把 Node 的 HTTP 请求转成 Web Request 交给 `worker.js` 处理，
 SSE 流式同样能逐块透传，`worker.js` 本身不做任何改动。
 它每次请求重新读取 `.env.local`，所以改了 token **不用重启服务**。
@@ -240,6 +270,10 @@ SSE 流式同样能逐块透传，`worker.js` 本身不做任何改动。
 **关于 API_KEY**：本地首次启动会自动生成一个（形如 `sk-cline-xxxxxxxx...`）写入 `.env.local`，
 并注入控制台页面，因此不用手填；若 `.env.local` 里已有值或用环境变量指定，则以你的为准。
 线上部署（Cloudflare / Vercel）仍需自己设置这个变量，因为本地文件不会被部署上去。
+
+> 📌 **需要 Node 22 或更高**。项目的 `.js` / `.mjs` 都用 ESM 写法但没有 `package.json`，
+> 依赖 Node 22+ 的语法自动探测（低版本会报 `Cannot use import statement outside a module`）。
+> 启动脚本会检查并把低版本提示出来。
 
 ---
 
@@ -606,6 +640,9 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 ├── api/index.js            # Vercel Edge Function 入口（由 build-vercel.mjs 自动生成，勿手改）
 ├── build-vercel.mjs        # 从 worker.js 生成 api/index.js（保证两端逻辑一致）
 ├── local-server.js         # 本地运行入口（node local-server.js，不部署也能跑）⭐
+├── start.mjs               # 启动脚本本体（跨平台；中文提示都在这里）⭐
+├── start.bat               # Windows 启动：双击即可（纯 ASCII 引导，见下方说明）
+├── start.sh                # Linux / macOS 启动
 ├── selftest.mjs            # 自检脚本（node selftest.mjs，113 项断言，用假上游验证）⭐
 ├── vercel.json             # Vercel 路由重写：/v1/* → /api/index
 ├── wrangler.toml           # CF 命令行部署配置（用复制代码方式可忽略）
