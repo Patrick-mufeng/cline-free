@@ -468,6 +468,33 @@ console.log("\n【10】控制台页面完整性");
   check("账号页含登录按钮", html.includes('id="btnLogin"'));
   check("登录区含跳转授权页的按钮", html.includes("btnOpenAuth"));
   check("展示设备码的容器存在", html.includes('id="deviceCode"'));
+
+  // 回归：状态提示曾用绝对定位的顶部浮层（#notes）呈现，它压在整个 .views 之上，
+  // 正好盖住账号页右上角的「登录新账号」按钮 —— 提示用户去登录，却挡住登录入口。
+  // 现统一改为右下角弹窗（syncNotices），这里确保浮层不再回来。
+  check("没有覆盖在视图之上的提示浮层（会挡住页头按钮）",
+    !html.includes('id="notes"') && !/\.notes\s*\{[^}]*position\s*:\s*absolute/.test(html),
+    "顶部提示浮层又出现了：#notes 绝对定位在 .views 顶部，会挡住各页头部按钮");
+  check("状态提示走右下角弹窗同步（syncNotices）",
+    html.includes("function syncNotices") && html.includes("sticky: true"),
+    "renderHealth 应通过 syncNotices 把状态提示发到右下角，而不是渲染到页面顶部");
+  check("弹窗支持动作按钮（提示里可直接去处置）",
+    html.includes("function bindToastAction") && html.includes('class="act"'),
+    "常驻提示需要一个按钮把用户带到处置位置");
+  check("常驻提示不自动消失（sticky 且无倒计时条）",
+    html.includes('(o.sticky ? " sticky" : "")') &&
+    html.includes(".toast:not(.out):not(.sticky)") &&
+    html.includes('var barHtml = o.sticky ? "" : '),
+    "sticky 提示不该被自动收走，也不该参与淘汰计数");
+  check("手动关掉的提示不会每 30 秒弹回来",
+    html.includes("muteNotice") && html.includes("mutedNotices[it.nid]"),
+    "syncNotices 每轮轮询都会跑，需要记住用户已关闭的提示");
+  check("本地首次运行不再被误报为「服务端未配置」",
+    html.includes("isLocalConsole") && html.includes("本地首次启动时账号池是空的，这是正常的"),
+    "本地账号池为空是预期状态，应提示去登录而非报配置错误");
+  check("云端账号丢失时有单独措辞（不说成配置缺失）",
+    html.includes("当前没有可用账号") && html.includes("重新部署后会丢失"),
+    "云端内存账号在冷启动后会丢，提示不应说成「未配置 CLINE_REFRESH_TOKEN」");
 }
 
 // =====================================================================

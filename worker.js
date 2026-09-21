@@ -228,7 +228,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "2.1.0";
+const VERSION = "2.2.0";
 
 // ===== 入口 =====
 // Cloudflare Workers 入口。Vercel 入口由 build-vercel.mjs 依据下面的
@@ -1808,8 +1808,10 @@ label.lb{ display:block; font-size:11px; color:var(--ink-3); margin-bottom:5px; 
 .chk{ display:inline-flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-2); cursor:pointer; user-select:none; }
 .chk input{ width:auto; accent-color:var(--accent); }
 
-/* ══ 提示条 ══ */
-.notes{ display:flex; flex-direction:column; gap:10px; }
+/* ══ 行内提示条 ══
+   只用于页面内固定位置（账号页的状态判断、模型页说明、登录结果）。
+   全局状态提示不放这里：它原来压在 .views 顶部，会盖住各页头部的按钮，
+   现改为右下角弹窗（见 toast / syncNotices）。 */
 .note{
   display:flex; align-items:center; gap:10px; padding:9px 12px; font-size:12px;
   border:2px solid; box-shadow:var(--shadow-sm);
@@ -1966,6 +1968,8 @@ details.rz pre{
   font-size:11px; background:var(--inset); border:1px solid var(--line-soft);
   padding:0 4px; word-break:break-all;
 }
+/* 动作按钮放在可滚动的 .ms 之外，否则长文案会把按钮挤进滚动区 */
+.toast .act{ margin-top:7px; }
 .toast .x{
   flex:none; width:20px; height:20px; padding:0; display:grid; place-items:center;
   font-size:13px; line-height:1; background:transparent; border:2px solid var(--line);
@@ -2167,7 +2171,8 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
     </div>
 
     <div class="views">
-      <div class="notes" id="notes" style="position:absolute;top:0;left:0;right:0;z-index:5;padding:12px 20px 0;pointer-events:none"></div>
+      <!-- 全局状态提示不在这里：见右下角 #toasts（本处原有一个绝对定位的提示条，
+           会盖住各页头部的按钮，已移除） -->
 
       <!-- ── 对话 ── -->
       <section class="view" id="v-chat">
@@ -2385,7 +2390,8 @@ var $ = function (id) { return document.getElementById(id); };
 var LS = {
   key:"cf.key", model:"cf.model", msgs:"cf.msgs", params:"cf.params", tab:"cf.tab",
   logs:"cf.logs", filter:"cf.filter", sort:"cf.sort", tests:"cf.tests",
-  theme:"cf.theme", follow:"cf.follow", sel:"cf.sel", freeOnly:"cf.freeOnly"
+  theme:"cf.theme", follow:"cf.follow", sel:"cf.sel", freeOnly:"cf.freeOnly",
+  muted:"cf.mutedNotices"
 };
 
 /* 国产模型厂商识别（按 model id 的 provider 段匹配）。
@@ -2420,8 +2426,7 @@ var state = {
   health:null, logs:[], filter:"all", search:"", sort:"region", sortDir:1,
   testing:false, busy:false, abort:null, snip:"curl",
   login:null, loginTimer:null, follow:true, selId:null,
-  healthDown:false,  // 上次健康检查是否失败（用于去重连接错误提示）
-  acctWarned:false   // 是否已就"账号池不可用"弹过窗（用于去重，避免每 30 秒弹一次）
+  healthDown:false   // 上次健康检查是否失败（用于去重连接错误提示）
 };
 
 function save(k,v){ try{ localStorage.setItem(k, typeof v==="string"?v:JSON.stringify(v)); }catch(e){} }
@@ -2497,6 +2502,16 @@ var TOAST_MS_DEFAULT = 5000;
 // 通知固定在右下角，堆到四五条时会长高到盖住对话页的输入框右端。
 var TOAST_MAX = 3;
 
+/* 被用户手动关掉的状态提示要记住，否则 30 秒后又被 syncNotices 同步出来，像是关不掉。
+   只对带 nid 的常驻提示生效；条件消失后自动解除，下次真出问题仍会提示。 */
+var mutedNotices = load(LS.muted, null);
+if(!mutedNotices || typeof mutedNotices !== "object") mutedNotices = {};
+function muteNotice(nid){
+  if(!nid) return;
+  mutedNotices[nid] = 1;
+  save(LS.muted, mutedNotices);
+}
+
 // 取某类通知的停留时长
 function toastDuration(kind){
   var ms = TOAST_MS[kind];
@@ -2519,30 +2534,60 @@ function dismissToast(el){
  *   kind: err / ok / warn / info（决定配色与停留时长，见 TOAST_MS）
  *   title: 加粗标题
  *   msg:   正文（纯文本，会转义；需要行内代码请自己拼）
+ *   opts（可选）:
+ *     nid    唯一标识。带 nid 的通知会被 syncNotices 复用/回收，重复调用只更新不新增
+ *     sticky 不自动消失（用于"需要用户处理"的状态提示，如未登录账号）
+ *     action {label, fn} 动作按钮，点了执行 fn 并关掉这条
  */
-function toast(kind, title, msg){
+function toast(kind, title, msg, opts){
   var box = $("toasts");
   if(!box) return null;
+  var o = opts || {};
   var type = TOAST_MS[kind] ? kind : "info";
 
-  // 只留最近几条：账号页连续点按钮时不该堆满整屏
-  var live = box.querySelectorAll(".toast:not(.out)");
+  // 同一个 nid 已经挂着 → 原地更新，不新增也不重播入场动画
+  // （状态提示每 30 秒由 loadHealth 同步一次，不能每次都闪一条新的）
+  // :not(.out) 是必须的：正在播关闭动画的元素还会在 DOM 里待一会儿，
+  // 若复用它，条件持续时提示也会跟着消失。
+  if(o.nid){
+    var prev = box.querySelector('.toast[data-nid="' + o.nid + '"]:not(.out)');
+    if(prev) return updateToast(prev, type, title, msg, o);
+  }
+
+  // 只留最近几条：账号页连续点按钮时不该堆满整屏。
+  // sticky 的不参与淘汰 —— 它是持续状态，不是一次性的操作回执。
+  var live = box.querySelectorAll(".toast:not(.out):not(.sticky)");
   for(var i = 0; i < live.length - (TOAST_MAX - 1); i++) dismissToast(live[i]);
 
   var icons = { err:"!", ok:"✓", warn:"▲", info:"i" };
   var el = document.createElement("div");
-  el.className = "toast " + type;
+  el.className = "toast " + type + (o.sticky ? " sticky" : "");
+  if(o.nid) el.setAttribute("data-nid", o.nid);
   el.setAttribute("role", type === "err" ? "alert" : "status");
+  // 倒计时条只给会自动消失的通知；sticky 常驻，没有"剩余时间"可言
+  var barHtml = o.sticky ? "" : '<div class="bar"><i class="run"></i></div>';
   el.innerHTML =
     '<span class="ic">' + (icons[type] || icons.info) + '</span>' +
     '<div class="bd">' +
       (title ? '<div class="ti">' + esc(title) + '</div>' : '') +
       (msg ? '<div class="ms">' + msg + '</div>' : '') +
-      '<div class="bar"><i class="run"></i></div>' +
+      (o.action ? '<div class="act"><button class="xs ghost" type="button"></button></div>' : '') +
+      barHtml +
     '</div>' +
     '<button class="x" type="button" title="关闭" aria-label="关闭">×</button>';
 
-  el.querySelector(".x").addEventListener("click", function(){ dismissToast(el); });
+  el.querySelector(".x").addEventListener("click", function(){
+    muteNotice(o.nid);
+    dismissToast(el);
+  });
+  bindToastAction(el, o);
+  el._sig = toastSig(type, title, msg, o);
+
+  // sticky：只显示不自动收走，等条件消失由 syncNotices 回收
+  if(o.sticky){
+    box.appendChild(el);
+    return el;
+  }
 
   // 进度条动画与自动关闭共用同一时长；悬停时 CSS 暂停动画，
   // 但定时器不会暂停，所以额外在 mouseenter/leave 上调整剩余时间。
@@ -2565,6 +2610,83 @@ function toast(kind, title, msg){
 
   box.appendChild(el);
   return el;
+}
+
+// 动作按钮：每次重建元素而不是改文案，否则原地更新会叠加监听器
+function bindToastAction(el, o){
+  var slot = el.querySelector(".act");
+  if(!slot) return;
+  var old = slot.querySelector("button");
+  if(old) old.parentNode.removeChild(old);
+  if(!o.action) return;
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "xs ghost";
+  btn.textContent = o.action.label || "";
+  if(o.action.fn){
+    btn.addEventListener("click", function(){
+      dismissToast(el);
+      o.action.fn();
+    });
+  }
+  slot.appendChild(btn);
+}
+
+// 通知内容指纹：用于判断是否真的需要重绘
+function toastSig(type, title, msg, o){
+  return [type, title || "", msg || "", (o.action && o.action.label) || "", o.sticky ? "s" : ""].join("\\u0000");
+}
+
+// 原地更新一条已存在的通知：内容没变就什么都不做，避免每轮轮询都重绘闪烁
+function updateToast(el, type, title, msg, o){
+  var next = toastSig(type, title, msg, o);
+  if(el._sig === next) return el;
+  el._sig = next;
+  bindToastAction(el, o);
+  el.className = "toast " + type + (o.sticky ? " sticky" : "");
+  el.querySelector(".ic").textContent = { err:"!", ok:"✓", warn:"▲", info:"i" }[type] || "i";
+  var bd = el.querySelector(".bd");
+  var ti = el.querySelector(".ti");
+  if(title){
+    if(!ti){ ti = document.createElement("div"); ti.className = "ti"; bd.insertBefore(ti, bd.firstChild); }
+    ti.textContent = title;
+  } else if(ti) ti.parentNode.removeChild(ti);
+  var ms = el.querySelector(".ms");
+  if(msg){
+    if(!ms){ ms = document.createElement("div"); ms.className = "ms"; bd.insertBefore(ms, bd.firstChild); }
+    ms.innerHTML = msg;
+  } else if(ms) ms.parentNode.removeChild(ms);
+  return el;
+}
+
+/**
+ * 把一组"持续状态提示"同步到右下角 —— 列表里没有的会被收走。
+ * 专治 loadHealth 每 30 秒跑一次的场景：条件持续时只更新那一两条，
+ * 条件消失时自动关闭，避免旧提示一直挂着误导用户。
+ *   items: [{nid, kind, title, msg, action}]
+ */
+function syncNotices(items){
+  var box = $("toasts");
+  if(!box) return;
+  items = items || [];
+  var keep = {};
+  for(var i = 0; i < items.length; i++){
+    var it = items[i];
+    keep[it.nid] = 1;
+    if(mutedNotices[it.nid]) continue;   // 用户手动关掉的，不再弹回来
+    toast(it.kind, it.title, it.msg, { nid: it.nid, sticky: true, action: it.action });
+  }
+  var have = box.querySelectorAll(".toast[data-nid]");
+  for(var j = 0; j < have.length; j++){
+    var nid = have[j].getAttribute("data-nid");
+    if(!keep[nid]) dismissToast(have[j]);   // 条件已消失
+  }
+  // 状态恢复后解除"已忽略"，否则下次真出同样的问题就再也提示不出来了
+  var cleared = false;
+  for(var nid2 in mutedNotices){
+    if(!keep[nid2]){ delete mutedNotices[nid2]; cleared = true; }
+  }
+  if(cleared) save(LS.muted, mutedNotices);
 }
 
 // 把 fetch/异常里的错误对象转成"标题 + 正文"两段，供 toast 使用
@@ -2659,36 +2781,68 @@ function renderHealth(h){
   $("verTxt").textContent="v"+h.version;
   $("cacheTxt").textContent="· 模型缓存 "+((h.models_cached||0));
 
-  var n="";
-  if(!ok) n+='<div class="note bad"><span class="grow">服务端未配置 <b>API_KEY</b>，聊天端点会拒绝所有请求。</span></div>';
-  else if(!state.key) n+='<div class="note info"><span class="grow">还没有访问密钥。本地运行会自动生成并注入。</span><button class="xs ghost" onclick="goConfig()">去填写</button></div>';
-  if(total===0) n+='<div class="note bad"><span class="grow">服务端未配置 <b>CLINE_REFRESH_TOKEN</b>，无法调用上游。</span><button class="xs ghost" onclick="goAccounts()">去登录</button></div>';
-  if(h.runtime_accounts>0) n+='<div class="note warn"><span class="grow">有 '+h.runtime_accounts+' 个登录得到的临时账号，重启后会消失，建议存进环境变量。</span><button class="xs ghost" onclick="goAccounts()">查看</button></div>';
-  var box=$("notes");
-  box.innerHTML=n;
-  box.style.pointerEvents=n?"auto":"none";
+  // 状态提示一律走右下角弹窗，不再用顶部横幅。
+  // ⚠️ 原因：原先的 #notes 是绝对定位压在 .views 顶部的浮层，会盖住各页头部的
+  //    按钮（账号页右上角正是「登录新账号」），而它自己的「去登录」又指向那一页。
+  //    本函数每 30 秒被 loadHealth 调一次，所以用 syncNotices 按 nid 复用/回收，
+  //    条件持续时只更新那一条，条件消失时自动收走。
+  var notices=[];
 
-  // 账号池不可用时用右下角弹窗提示，不再占用顶部横幅。
-  // ⚠️ 本函数每 30 秒被 loadHealth 调一次，所以必须去重：同一个故障只弹一次，
-  //    恢复可用后再出问题才会重新弹。持续状态由侧栏「账号池 0 / N」的配色体现。
-  if(total>0 && avail===0){
-    if(!state.acctWarned){
-      state.acctWarned=true;
-      var allOff=det.length>0&&det.every(function(a){return !a.enabled;});
-      if(allOff){
-        toast("err","没有可用账号",
-          "账号池里的 <b>"+total+" 个账号全部被停用</b>，请求会直接失败（429）。"+
-          "到「账号」页点「全部启用」，或逐个启用要用的账号。");
-      }else{
-        toast("warn","没有可用账号",
-          "当前 "+total+" 个账号都在冷却中，请求会直接返回 429。"+
-          "可以在「账号」页点「重置全部冷却」立即重试，或等冷却结束自动恢复。");
-      }
-    }
-  }else{
-    state.acctWarned=false;   // 恢复可用，下次故障重新提示
+  if(!ok){
+    notices.push({nid:"no-key",kind:"err",title:"服务端未配置 API_KEY",
+      msg:"聊天端点会拒绝所有请求。在部署环境里设置 <code>API_KEY</code> 后重新部署。"});
+  }else if(!state.key){
+    notices.push({nid:"no-client-key",kind:"info",title:"还没有填访问密钥",
+      msg:"本地运行会自动生成并注入，无需手填；用第三方客户端时才需要复制过去。",
+      action:{label:"去填写",fn:goConfig}});
   }
+
+  if(total===0){
+    // 区分两种情形，措辞与处置都不同：
+    //  * 本地首次运行：账号池本来就是空的，下一步是去登录，不是"配置错了"。
+    //    local-server.js 启动提示也是这个口径（「未配置 — 打开控制台登录即可」）。
+    //  * 云端部署：控制台登录得到的是内存账号，冷启动/实例回收后池会变空，
+    //    这时说"未配置"会让人以为自己操作失败，需说清是临时账号丢了。
+    if(isLocalConsole()){
+      notices.push({nid:"no-account",kind:"info",title:"还没有账号",
+        msg:"本地首次启动时账号池是空的，这是正常的。登录一个 Cline 账号即可开始使用。",
+        action:{label:"去登录",fn:goAccounts}});
+    }else{
+      notices.push({nid:"no-account",kind:"warn",title:"当前没有可用账号",
+        msg:"账号池是空的，请求无法调用上游。可在「账号」页登录，或把 refreshToken 填进环境变量 "+
+            "<code>CLINE_REFRESH_TOKEN</code>；控制台登录的账号只存在内存里，重新部署后会丢失。",
+        action:{label:"去登录",fn:goAccounts}});
+    }
+  }
+
+  if(total>0 && avail===0){
+    var allOff=det.length>0&&det.every(function(a){return !a.enabled;});
+    if(allOff){
+      notices.push({nid:"no-avail",kind:"err",title:"没有可用账号",
+        msg:"账号池里的 <b>"+total+" 个账号全部被停用</b>，请求会直接失败（429）。",
+        action:{label:"全部启用",fn:function(){ goAccounts(); $("btnEnableAll").click(); }}});
+    }else{
+      notices.push({nid:"no-avail",kind:"warn",title:"没有可用账号",
+        msg:"当前 "+total+" 个账号都在冷却中，请求会直接返回 429。等冷却结束会自动恢复。",
+        action:{label:"重置全部冷却",fn:function(){ goAccounts(); $("btnResetAll").click(); }}});
+    }
+  }
+
+  if(h.runtime_accounts>0){
+    notices.push({nid:"runtime-acct",kind:"warn",
+      title:"有 "+h.runtime_accounts+" 个临时账号",
+      msg:"这些账号只存在当前实例内存里，重启或重新部署后消失。要长期保留，把 refreshToken 填进环境变量。",
+      action:{label:"查看",fn:goAccounts}});
+  }
+
+  syncNotices(notices);
   if(!$("v-accounts").hidden) renderAccts();
+}
+
+/* 当前页面是否由本地服务器提供（local-server.js 会注入 __CLINE2API__）。
+   用来区分"本地还没登录"和"云端账号丢了" —— 两者提示与处置不同。 */
+function isLocalConsole(){
+  try{ return !!(window.__CLINE2API__ && window.__CLINE2API__.key); }catch(e){ return false; }
 }
 function goConfig(){ showTab("config"); $("key").focus(); }
 function goAccounts(){ showTab("accounts"); }
@@ -3293,9 +3447,9 @@ function send(){
   var text=$("input").value.trim();
   if(!text) return;
   if(!state.key){
-    var box=$("notes");
-    box.innerHTML='<div class="note warn"><span class="grow">请先在「接入配置」填写 API Key。</span><button class="xs ghost" onclick="goConfig()">去填写</button></div>';
-    box.style.pointerEvents="auto";
+    // 与 renderHealth 的常驻提示区分：这条是对"点了发送"的即时回应，会自动消失
+    toast("warn","请先填写 API Key","聊天端点需要密钥才能调用，到「接入配置」页填写。",
+      {action:{label:"去填写",fn:goConfig}});
     return;
   }
   state.busy=true;
