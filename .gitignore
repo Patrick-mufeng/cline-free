@@ -15,3 +15,6 @@ dist/
 
 # 本地测试副本（worker.js 的测试用拷贝，避免双份维护）
 test/
+
+# 本地工具产物（ZCode 计划文件等）
+.zcode/

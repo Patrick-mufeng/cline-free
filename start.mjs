@@ -64,16 +64,20 @@ if (tokenFilled) {
 } else {
   console.log("[3/3] [提示] .env.local 里的 CLINE_REFRESH_TOKEN 还是空的");
   console.log();
-  console.log("      获取方式，任选其一：");
-  console.log("        a. python cline_oauth.py");
-  console.log("           跑起来后浏览器打开它给出的链接登录，自动打印 token");
-  console.log("        b. GitHub Actions 工作流 .github/workflows/get-token.yml");
-  console.log("           手机也能操作，token 通过 Telegram 私发给你");
+  console.log("      服务照常启动。不想配 token 也能用，两种办法任选：");
   console.log();
-  console.log("      拿到后填进 .env.local 的这一行：");
+  console.log("      【一】直接在浏览器里登录（最省事，推荐先试这个）");
+  console.log("            打开 http://localhost:8787 → 「账号」页 → 「登录新账号」");
+  console.log("            页面会给出授权链接，登录后账号立即可用。");
+  console.log("            注意：这样登录的账号只在内存里，重启会丢；");
+  console.log("            页面会把 refreshToken 显示出来，复制到下面那行即可长期保留。");
+  console.log();
+  console.log("      【二】跑命令行脚本，自动写入 .env.local（适合长期使用）");
+  console.log("            python cline_oauth.py");
+  console.log("            它会打印一个授权链接，浏览器里登录一次即可。");
+  console.log();
+  console.log("      手动填写的话，就是下面这一行（填完不用重启服务）：");
   console.log("        CLINE_REFRESH_TOKEN=你的token");
-  console.log();
-  console.log("      服务仍会启动，方便你先打开控制台页面看看。");
   console.log();
 }
 

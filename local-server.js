@@ -93,9 +93,9 @@ const tokenCount = countAccounts(bootEnv.CLINE_REFRESH_TOKEN);
 const keyInfo = ensureLocalApiKey();
 
 console.log("=".repeat(64));
-console.log("cline2api 本地服务");
+console.log("cline-free 本地服务");
 console.log("=".repeat(64));
-console.log("CLINE_REFRESH_TOKEN :", tokenCount > 0 ? `已配置 ${tokenCount} 个账号` : "⚠️  未配置 — 先跑 python cline_oauth.py 拿 token，服务无需重启");
+console.log("CLINE_REFRESH_TOKEN :", tokenCount > 0 ? `已配置 ${tokenCount} 个账号` : `未配置 — 打开 http://localhost:${PORT} 在「账号」页登录即可`);
 if (keyInfo.generated) {
   console.log("API_KEY             :", keyInfo.key);
   console.log("                      ↑ 首次运行自动生成，已写入 .env.local（无需手填）");
