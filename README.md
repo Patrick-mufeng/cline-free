@@ -2,9 +2,9 @@
 
 把 Cline（https://cline.bot）的白嫖模型能力转成 OpenAI 兼容 API，部署在 Cloudflare Workers 上，免费、无服务器、无需本地运行。
 
-> 逆向自 https://github.com/luawei1/cline2api
+> 📌 作者 **Patrick** · 公众号 **AI实用talk** · 仓库 [Patrick-mufeng/cline-free](https://github.com/Patrick-mufeng/cline-free)
 >
-> （Go 版代理），重写为纯 JS 的 Worker。
+> 本项目的上游来源与许可声明见文末「[来源与许可](#来源与许可)」。
 
 ---
 
@@ -67,7 +67,9 @@ python3 cline_oauth.py
 - 🔁 工作流运行完自动**清理旧运行记录，只保留最新 1 条**
 - ⏱️ 授权链接推送 TG 失败会中止，宁可失败也不把 token 写进日志
 
-### 方式④：在原版 Go 程序里提取（如果你已经用过 cline2api）
+### 方式④：从原版 Go 程序里提取（如果你已经用过 cline2api）
+
+如果你手上已经在用上游的 Go 版 cline2api，可以直接从它的账号文件里取：
 
 1. 下载原版 [cline2api releases](https://github.com/luawei1/cline2api/releases) 的运行文件
 2. 运行 `./cline-proxy --login`，浏览器登录 Cline
@@ -90,7 +92,7 @@ python3 cline_oauth.py
 
 1. 打开本仓库 `worker.js`，**全选复制全部代码**
 2. 登录 [dash.cloudflare.com](https://dash.cloudflare.com) → **Workers & Pages** → **创建** → **创建 Worker**
-3. 名字填 `cline2api`（可自定义）→ **部署**
+3. 名字填 `cline-free`（可自定义）→ **部署**
 4. 进入 Worker → **编辑代码** → 删除默认代码，**粘贴**刚才复制的 `worker.js` 全部内容 → **部署**（右上角）
 5. **配置环境变量**（重点 ⚠️）：
    - Worker → **设置** → **变量和机密** → **添加**：
@@ -98,14 +100,14 @@ python3 cline_oauth.py
        - **支持多账号**：一行一个 token，见下文「多账号」章节
      - **机密(Secret)**：`API_KEY` = 你的访问密钥，例如 `sk-cline-xxx`（建议必填，可自定义）
    - ⚠️ **保存后必须再点一次「部署」触发重新编译**，变量才会生效！
-6. 完成！你的 API Base URL 就是 `https://cline2api.<你的子域>.workers.dev`
+6. 完成！你的 API Base URL 就是 `https://cline-free.<你的子域>.workers.dev`
 
 > 💡 验证环境变量是否生效，访问诊断端点：
 > ```bash
-> curl https://cline2api.<你的子域>.workers.dev/v1/health
+> curl https://cline-free.<你的子域>.workers.dev/v1/health
 > ```
 > 返回 `"api_key_configured":true` 表示 `API_KEY` 已生效，`account_count` 显示已配置的账号数量。
-> 也可以直接浏览器打开根路径 `https://cline2api.<你的子域>.workers.dev/` 用内置控制台查看。
+> 也可以直接浏览器打开根路径 `https://cline-free.<你的子域>.workers.dev/` 用内置控制台查看。
 
 ### 需要的东西&环境变量说明
 
@@ -127,7 +129,7 @@ python3 cline_oauth.py
 部署后直接浏览器打开根路径即可使用，**无需额外前端、无需构建**：
 
 ```text
-https://cline2api.<你的子域>.workers.dev/
+https://cline-free.<你的子域>.workers.dev/
 ```
 
 界面是**左侧导航栏 + 右侧工作区**，视觉风格为**像素终端（PIXEL OPS）**：
@@ -200,13 +202,13 @@ https://cline2api.<你的子域>.workers.dev/
 ### 验证部署
 
 ```bash
-curl https://cline2api.<你的子域>.workers.dev/v1/models \
+curl https://cline-free.<你的子域>.workers.dev/v1/models \
   -H "Authorization: Bearer <你的API_KEY>"
 ```
 应返回模型列表。再发一次聊天：
 
 ```bash
-curl https://cline2api.<你的子域>.workers.dev/v1/chat/completions \
+curl https://cline-free.<你的子域>.workers.dev/v1/chat/completions \
   -H "Authorization: Bearer <你的API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"model":"poolside/laguna-s-2.1:free","messages":[{"role":"user","content":"你好"}]}'
@@ -227,7 +229,7 @@ node local-server.js
 #    浏览器打开 http://localhost:8787 即为控制台
 #    自动生成的 API_KEY 会直接注入页面，不用手填
 
-# 3. 本地自检（不需要真实账号，用假上游验证全部逻辑，68 项断言）
+# 3. 本地自检（不需要真实账号，用假上游验证全部逻辑，113 项断言）
 node selftest.mjs
 ```
 
@@ -269,8 +271,8 @@ npm i -g vercel
 vercel login
 
 # 3. 拉代码
-git clone https://github.com/pingmike2/cline2api-workers.git
-cd cline2api-workers
+git clone https://github.com/Patrick-mufeng/cline-free.git
+cd cline-free
 
 # 4. 首次关联项目（交互里选 Create new project，Framework Preset 选 Other）
 vercel link
@@ -291,7 +293,7 @@ vercel --prod
 
 ### 方式②：Dashboard 关联 Git（推送后自动部署）
 
-1. 打开 [vercel.com/new](https://vercel.com/new) → **Import Git Repository** → 选 `pingmike2/cline2api-workers`
+1. 打开 [vercel.com/new](https://vercel.com/new) → **Import Git Repository** → 选 `Patrick-mufeng/cline-free`
 2. **Production Branch 选 `main`**（本仓库只有 main 一条分支，CF 和 Vercel 两份代码都在里面）
 3. **Framework Preset 选 `Other`**，Root Directory 保持 `.`（⚠️ 不要填 `api`）→ Build / Output 全部留空
 4. **Environment Variables** 添加：
@@ -339,15 +341,15 @@ curl https://<项目名>.vercel.app/v1/chat/completions \
 
 ### ⚠️ 关键：直接用 Workers 域名，不要用自定义域名
 
-- **用 `https://cline2api.<你的子域>.workers.dev/v1`** 作为模型 **Base URL / API Base**。
+- **用 `https://cline-free.<你的子域>.workers.dev/v1`** 作为模型 **Base URL / API Base**。
 - **不要用绑定的自定义域名**（如 `api.llm.xxx.com`）：AgentScope 平台对接时，
   自定义域名可能因证书/路由/鉴权头处理问题导致调用失败或鉴权不过，
   直接用 Workers 官方域名最稳。
 
 ### AgentScope 里怎么配（OpenAI 兼容模式）
 
-- **API Base / Base URL**：`https://cline2api.<你的子域>.workers.dev/v1`
-  （部分平台要求不带 `/v1` 的填写为 `https://cline2api.<你的子域>.workers.dev`，按平台提示试）
+- **API Base / Base URL**：`https://cline-free.<你的子域>.workers.dev/v1`
+  （部分平台要求不带 `/v1` 的填写为 `https://cline-free.<你的子域>.workers.dev`，按平台提示试）
 - **API Key**：填你设置的 `API_KEY` 值（如 `sk-cline-xxx`）
 - **Model**：`deepseek/deepseek-v4-flash`（默认）或 `poolside/laguna-s-2.1:free`、`zai/glm-5.2`（付费，约 $0.0008/次）。
   `depth/deepseek-v4-flash` 是 `deepseek/deepseek-v4-flash` 的拼写别名，同款免费，任意前缀均可。
@@ -383,7 +385,7 @@ User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 ## 五、使用
 
 ```text
-Base URL: https://cline2api.<你的子域>.workers.dev/v1   （或 https://<项目名>.vercel.app/v1）
+Base URL: https://cline-free.<你的子域>.workers.dev/v1   （或 https://<项目名>.vercel.app/v1）
 API Key:  <你设置的 API_KEY>
 Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 ```
@@ -550,7 +552,7 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 > - **新增内置控制台**：浏览器打开根路径即可自检（健康状态 / 模型列表 / 试聊天 / TTFT 显示），
 >   无需额外前端与构建。
 > - **新增本地运行**：`node local-server.js` 不部署也能跑（读 `.env.local`）；
->   `node selftest.mjs` 用假上游验证全部逻辑（38 项断言）。
+>   `node selftest.mjs` 用假上游验证全部逻辑（当时 38 项断言，现已增至 113 项）。
 > - **`api/index.js` 改为自动生成**：`node build-vercel.mjs` 从 `worker.js` 生成，
 >   不再需要人工同步两份代码。
 >
@@ -604,7 +606,7 @@ Model:    cline-free/deepseek-v4.1-flash   （默认，免费）
 ├── api/index.js            # Vercel Edge Function 入口（由 build-vercel.mjs 自动生成，勿手改）
 ├── build-vercel.mjs        # 从 worker.js 生成 api/index.js（保证两端逻辑一致）
 ├── local-server.js         # 本地运行入口（node local-server.js，不部署也能跑）⭐
-├── selftest.mjs            # 自检脚本（node selftest.mjs，56 项断言，用假上游验证）⭐
+├── selftest.mjs            # 自检脚本（node selftest.mjs，113 项断言，用假上游验证）⭐
 ├── vercel.json             # Vercel 路由重写：/v1/* → /api/index
 ├── wrangler.toml           # CF 命令行部署配置（用复制代码方式可忽略）
 ├── cline_oauth.py          # 获取 CLINE_REFRESH_TOKEN 的脚本 ⭐
@@ -652,10 +654,30 @@ node selftest.mjs
 
 ---
 
-## 许可
+## 来源与许可
 
-本项目基于 [luawei1/cline2api](https://github.com/luawei1/cline2api)（Go 版）逆向重写，遵循其原许可证：
+**本仓库**：[Patrick-mufeng/cline-free](https://github.com/Patrick-mufeng/cline-free)
+· 作者 **Patrick** · 公众号 **AI实用talk**
 
-**MIT License** © 2026 [luawei1](https://github.com/luawei1)（原版）& [pingmike2](https://github.com/pingmike2)（Workers 版）· 详见 [LICENSE](LICENSE)
+本项目是衍生作品，来源链条如下（按 MIT 协议保留原有版权声明）：
 
-Workers 版改动部分同样以 MIT 协议开源。
+| 环节 | 项目 | 说明 |
+|---|---|---|
+| 1️⃣ 原版 | [luawei1/cline2api](https://github.com/luawei1/cline2api) | Go 版反向代理，本项目的思路与接口来源 |
+| 2️⃣ Workers 版 | [pingmike2/cline2api-workers](https://github.com/pingmike2/cline2api-workers) | 重写为纯 JS 的 Worker，本项目 `worker.js` 的代码基础 |
+| 3️⃣ **本版 cline-free** | 本仓库 | 在 2️⃣ 基础上继续改造，见下 |
+
+**本版（cline-free）主要改造内容**：
+
+- **内置控制台**（像素终端风格，单文件自包含）：对话测试、账号页、模型页、日志页、接入配置页
+- **多账号池**：429 自动解析上游冷却时长并切号重试，全部冷却时直接返回不再空转
+- **页面内登录账号**：`/v1/login/start`、`/v1/login/poll` 走 WorkOS 设备授权码流程（均要求 API_KEY）
+- **模型列表白名单过滤**：只放行确定免费的模型，并新增 `channel` 字段标明"免费"依据来源
+- **工程化**：`console.src.html` 前端源码 + 两个构建脚本（自动同步 Workers / Vercel 两份入口）、
+  `local-server.js` 本地运行、`selftest.mjs` 自检（113 项断言）
+
+**MIT License** © 2026 [luawei1](https://github.com/luawei1)（原版）
+& [pingmike2](https://github.com/pingmike2)（Workers 版）
+& [Patrick-mufeng](https://github.com/Patrick-mufeng)（本版）· 详见 [LICENSE](LICENSE)
+
+三版均以 MIT 协议开源。

@@ -1,7 +1,11 @@
 /**
- * cline2api - Cloudflare Workers 版
+ * cline-free - Cloudflare Workers 版
  *
- * 逆向自 https://github.com/luawei1/cline2api (Go 版反向代理)
+ * 把 Cline (https://cline.bot) 的免费模型能力转成 OpenAI / Anthropic 兼容 API。
+ *
+ * 来源：逆向自 https://github.com/luawei1/cline2api (Go 版反向代理)，
+ *       经 pingmike2/cline2api-workers 重写为纯 JS Worker，本项目在其基础上继续改造。
+ *       作者 Patrick · 公众号 AI实用talk · 详见 README.md 文末「来源与许可」。
  *
  * 核心逻辑：
  *  1. 每次请求用 refreshToken 换 accessToken（缓存到内存，过期自动刷新）

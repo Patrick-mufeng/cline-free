@@ -6,6 +6,9 @@
 > **完整的 Vercel 部署教程见 [README.md](./README.md) 第三章「部署到 Vercel」**，
 > 本文只保留两版差异对照，便于排查问题。
 
+> 📌 本文标题里的 `Cline2API` 是历史名称，项目现已更名为 **cline-free**，
+> 仓库地址见 [README.md](./README.md) 文末「来源与许可」。
+
 ## 为什么用 Vercel？
 
 - CF Workers 域名对 `User-Agent` 挑得凶（非浏览器 UA 直接 `1010`）；Vercel 域名**不挑 UA**，
@@ -35,7 +38,10 @@
 | UA 要求 | **必须浏览器 UA**，否则 `1010` | 不挑 UA |
 | 域名保护 | 无 | 自动生成的域名受 Deployment Protection 限制，生产别名 `项目名.vercel.app` 公开 |
 
-> ️ 改功能时 `worker.js` 与 `api/index.js` **两份都要同步改**，否则两版行为会不一致。
+> ⚠️ 改功能时**只需改 `worker.js`**，然后运行 `node build-vercel.mjs` 自动同步
+> `api/index.js`（不要手改生成的文件）。控制台前端则改 `console.src.html`，
+> 先跑 `node build-console.mjs` 注入 `worker.js`，再跑 `build-vercel.mjs`。
+> 详见 README.md 第六章「改了代码之后要跑什么」。
 
 ## 测试
 
