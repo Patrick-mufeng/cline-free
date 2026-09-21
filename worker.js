@@ -228,7 +228,7 @@ async function refreshFreeModels() {
 // 默认模型：Cline 免费 DeepSeek V4.1 Flash 通道（cline-free/ 官方免费额度，无需 credits）
 // 逆向自官方插件 recommended-models free 列表：cline-free/deepseek-v4.1-flash
 const DEFAULT_MODEL = "cline-free/deepseek-v4.1-flash";
-const VERSION = "2.2.0";
+const VERSION = "2.3.0";
 
 // ===== 入口 =====
 // Cloudflare Workers 入口。Vercel 入口由 build-vercel.mjs 依据下面的
@@ -273,6 +273,9 @@ async function handleRequest(request, env) {
       runtime_accounts: accounts && accounts.filter((a) => a.runtime).length || 0,
       model: DEFAULT_MODEL,
       models_cached: modelsCache ? modelsCache.length : 0,
+      // token 用量统计（含按模型/按天/按账号拆分）。本端点不鉴权，本地自用没问题；
+      // 部署到公网时它会公开你的用量规模，介意就把这段挪到独立鉴权端点。
+      usage: usageSummary(),
     }, 200);
   }
 
@@ -416,6 +419,9 @@ function listAccounts(env) {
     if (!a.id) a.id = accountId(a);
     a.enabled = !disabledIds.has(a.id);
   }
+  // 账号对象每次重建时 usage 是空的，从全局按 id 回填，保证重启后账号卡上的
+  // token 数不归零（byAccount 可以从磁盘恢复，账号对象则不行）
+  reattachAccountUsage(pool);
   return pool;
 }
 
@@ -447,6 +453,8 @@ function accountSummaries(env) {
       last_error_at: a.lastErrorAt || 0,
       last_used_at: a.lastUsedAt || 0,
     },
+    // 该账号消耗的 token（按上游调用计，含切号重试的那几次）
+    usage: a.usage || emptyUsage(),
   }));
 }
 
@@ -463,6 +471,280 @@ function markAccountResult(err) {
     acc.lastError = null;
     acc.lastUsedAt = Date.now();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Token 用量统计
+//
+// 记的是每一次**上游调用**的消耗，不是每一个客户端请求。免费通道额度用尽时
+// 会自动切号重试，一次客户端请求可能真的打 2~3 次上游，那几次都实打实烧了 token
+// —— 按上游调用记，才看得出额度到底去哪了（重试浪费是这里最有价值的信息）。
+//
+// 改这块之前先读这三条约束，每一条都对应一个具体的坑：
+//
+//  1. 绝不能在转发前读流。clone().text() 会把整个 SSE 读完，流式首字节要等到模型
+//     生成完才到客户端（详见 clineFetchWithRetry 里那段注释）。usage 只能在已有的
+//     pump 循环里顺手取，不能为了统计新增 tee/clone。
+//
+//  2. 账号归属必须在发起 fetch 的瞬间快照。currentAccount 是模块级的，而 enqueue
+//     只串行化 fetch 本身 —— 响应头一到就放行，响应体还在流，等 usage 在流尾到达时
+//     currentAccount 早被下一个请求改掉了。所以用 WeakMap 把 Response 绑到当时的
+//     账号对象上（bindResponseAccount），落账时按 Response 反查。
+//
+//  3. 上游没给 usage 时（客户端提前 abort、上游省略收尾 chunk）记 missing 计数，
+//     不要用字符数估算。估算值混进统计会让整份数字失去意义。
+// ---------------------------------------------------------------------------
+const USAGE_DAYS_KEEP = 30;   // 按天统计的保留窗口
+const USAGE_FLUSH_MS = 1500;  // 落盘防抖：上游请求密集时不至于每次都写文件
+
+// Response → 账号对象。只存引用不存 token，随 Response 一起被 GC。
+const respAccounts = new WeakMap();
+
+function emptyUsage() {
+  return { input: 0, output: 0, reasoning: 0, total: 0, calls: 0, missing: 0 };
+}
+
+let usageStats = {
+  since: Date.now(),  // 统计起点，界面要据此标注"统计自…"，避免被误读成历史总量
+  // 客户端请求数。单独放顶层而不是塞进 usage 桶里：它和 token 不是同一维度的量，
+  // 装进桶里会让 per-model / per-account 的桶都带上一个没意义的计数字段。
+  // 它唯一的用途是和"上游调用数"（total.calls）对比，算出重试放大倍数。
+  clientRequests: 0,
+  total: emptyUsage(),
+  byModel: {},        // 模型 ID → 用量
+  byDay: {},          // YYYY-MM-DD → 用量
+  byAccount: {},      // 账号 id → 用量
+};
+
+// 每个客户端聊天请求调一次（鉴权通过后、发给上游之前）。
+// 与 total.calls 的差值就是"免费的隐性成本"：空响应重试、额度耗尽切号，
+// 这些都实打实消耗上游额度，但客户端只感知到一次请求。
+function countClientRequest() {
+  usageStats.clientRequests += 1;
+  scheduleUsageFlush();
+}
+
+// 上游 usage 的形状在各条路径上不完全一致（OpenAI 风格 / Anthropic 风格 /
+// 上游有时包一层 data），这里统一抽成 {input, output, reasoning, total}。
+function pickUsage(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const pos = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+  };
+  const input = pos(raw.prompt_tokens ?? raw.input_tokens);
+  const output = pos(raw.completion_tokens ?? raw.output_tokens);
+  let total = pos(raw.total_tokens);
+  const reasoning = pos(raw.completion_tokens_details?.reasoning_tokens);
+  // 全 0 视为"上游没给有效 usage"：有些上游会在收尾 chunk 里塞一个全 0 的对象，
+  // 把它当成"这次消耗为 0"会让成功率虚高，按缺失记更诚实。
+  if (!input && !output && !total) return null;
+  if (!total) total = input + output;
+  return { input, output, reasoning, total };
+}
+
+// 本地日期键（YYYY-MM-DD）。用本地时间而非 UTC：免费额度是按自然日重置的，
+// 用户看到的"今天"应该和他自己的日历一致。Worker 里 TZ 是 UTC，本地是系统时区，
+// 两种环境下用同一套本地取值语义都成立。
+function usageDayKey(ts) {
+  const d = new Date(ts);
+  const p = (n) => (n < 10 ? "0" : "") + n;
+  return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+}
+
+function addUsage(bucket, u) {
+  bucket.input += u.input;
+  bucket.output += u.output;
+  bucket.reasoning += u.reasoning;
+  bucket.total += u.total;
+  bucket.calls += 1;
+}
+
+// 上游响应拿到手就立刻调用，把账号钉在这条 Response 上（约束 2）。
+function bindResponseAccount(resp) {
+  if (resp && currentAccount) respAccounts.set(resp, currentAccount);
+  return resp;
+}
+
+function accountUsage(acc) {
+  if (!acc) return null;
+  if (!acc.usage) acc.usage = emptyUsage();
+  return acc.usage;
+}
+
+// 落一笔用量。resp 用来反查账号；rawUsage 是上游给的原始 usage 对象。
+// 注意 calls 记的是"上游调用次数"，与客户端请求数可能不等（见文件头那段）。
+function recordUsage(resp, rawUsage, meta) {
+  const u = pickUsage(rawUsage);
+  const acc = resp ? respAccounts.get(resp) : null;
+  const model = (meta && meta.model) || "unknown";
+
+  if (!u) {
+    // 没拿到 usage：客户端提前 abort、或上游省略了收尾 chunk。
+    usageStats.total.missing += 1;
+    const au = accountUsage(acc);
+    if (au) au.missing += 1;
+    return null;
+  }
+
+  addUsage(usageStats.total, u);
+  if (!usageStats.byModel[model]) usageStats.byModel[model] = emptyUsage();
+  addUsage(usageStats.byModel[model], u);
+
+  const day = usageDayKey(Date.now());
+  if (!usageStats.byDay[day]) usageStats.byDay[day] = emptyUsage();
+  addUsage(usageStats.byDay[day], u);
+
+  if (acc) {
+    const au = accountUsage(acc);
+    addUsage(au, u);
+    if (acc.id) {
+      if (!usageStats.byAccount[acc.id]) usageStats.byAccount[acc.id] = emptyUsage();
+      addUsage(usageStats.byAccount[acc.id], u);
+    }
+  }
+
+  pruneUsageDays();
+  scheduleUsageFlush();
+  return u;
+}
+
+// 只保留最近 USAGE_DAYS_KEEP 天的明细，避免长时间运行后无限增长
+function pruneUsageDays() {
+  const keys = Object.keys(usageStats.byDay);
+  if (keys.length <= USAGE_DAYS_KEEP) return;
+  keys.sort();  // YYYY-MM-DD 字典序即时间序
+  for (const k of keys.slice(0, keys.length - USAGE_DAYS_KEEP)) {
+    delete usageStats.byDay[k];
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 统计持久化（可选）
+//
+// Worker / Vercel 上不注入，统计只活在当前实例内存里 —— 那边没有可写的本地文件
+// 系统，强上 KV/D1 会破坏本项目"单文件复制粘贴即可部署"的定位。
+// 本地 local-server.js 会注入一个落盘实现，重启后统计不丢。
+//
+// 为什么挂在 globalThis 而不是 export：Cloudflare 与 Vercel 都会校验模块的具名导出
+// （CF 把具名导出当成额外入口，Vercel 只认 default/config），多出一个函数导出可能
+// 导致部署报错。挂全局对象在三个运行时下都成立，也不需要改各自入口的构建脚本。
+// ---------------------------------------------------------------------------
+let usagePersistCb = null;   // (snapshot) => void
+let usageFlushTimer = null;
+
+function setUsagePersistence(fn) {
+  usagePersistCb = typeof fn === "function" ? fn : null;
+  if (usagePersistCb) scheduleUsageFlush();
+}
+
+// 把磁盘上恢复的统计装回内存。累加语义 —— 磁盘快照与内存初值相加，
+// 这样即使注入发生在若干次请求之后也不会丢数据。
+function restoreUsage(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  const merge = (target, src) => {
+    if (!src || typeof src !== "object") return target;
+    for (const k of ["input", "output", "reasoning", "total", "calls", "missing"]) {
+      const n = Number(src[k]);
+      if (Number.isFinite(n) && n > 0) target[k] += Math.round(n);
+    }
+    return target;
+  };
+  merge(usageStats.total, snap.total);
+  for (const [k, v] of Object.entries(snap.byModel || {})) {
+    if (!usageStats.byModel[k]) usageStats.byModel[k] = emptyUsage();
+    merge(usageStats.byModel[k], v);
+  }
+  for (const [k, v] of Object.entries(snap.byDay || {})) {
+    if (!usageStats.byDay[k]) usageStats.byDay[k] = emptyUsage();
+    merge(usageStats.byDay[k], v);
+  }
+  for (const [k, v] of Object.entries(snap.byAccount || {})) {
+    if (!usageStats.byAccount[k]) usageStats.byAccount[k] = emptyUsage();
+    merge(usageStats.byAccount[k], v);
+  }
+  if (Number.isFinite(snap.since) && snap.since > 0) {
+    usageStats.since = Math.min(usageStats.since, snap.since);
+  }
+  const cr = Number(snap.clientRequests);
+  if (Number.isFinite(cr) && cr > 0) usageStats.clientRequests += Math.round(cr);
+  return true;
+}
+
+// 账号级用量也要能恢复：磁盘快照里按 id 存着 byAccount，而账号对象的 usage
+// 是每次 parseAccounts 重建时新起的，所以恢复后要按 id 回填到账号对象上。
+function reattachAccountUsage(pool) {
+  for (const a of pool) {
+    if (!a.id) continue;
+    const u = usageStats.byAccount[a.id];
+    if (u && !a.usage) a.usage = { ...u };
+  }
+}
+
+function exportUsage() {
+  return JSON.parse(JSON.stringify(usageStats));
+}
+
+function scheduleUsageFlush() {
+  if (!usagePersistCb || usageFlushTimer) return;
+  usageFlushTimer = setTimeout(() => {
+    usageFlushTimer = null;
+    try { usagePersistCb(exportUsage()); } catch (e) { /* 落盘失败不影响服务 */ }
+  }, USAGE_FLUSH_MS);
+  // Node 环境下别让这个定时器拖住进程退出（本地 Ctrl+C 要能立刻停）
+  if (usageFlushTimer && typeof usageFlushTimer.unref === "function") usageFlushTimer.unref();
+}
+
+// 立即冲刷（进程退出前调用），返回是否有回调可用
+function flushUsageNow() {
+  if (usageFlushTimer) { clearTimeout(usageFlushTimer); usageFlushTimer = null; }
+  if (!usagePersistCb) return false;
+  try { usagePersistCb(exportUsage()); return true; } catch (e) { return false; }
+}
+
+// 供 local-server.js 这类宿主接入持久化的句柄（见上面「为什么挂在 globalThis」）
+globalThis.__clineUsage = { setUsagePersistence, restoreUsage, exportUsage, flushUsageNow };
+
+// 给 /v1/health 用的汇总视图：把内部结构转成前端直接可用的形状
+function usageSummary() {
+  const t = usageStats.total;
+  const round1 = (v) => (v ? Number(v.toFixed(1)) : 0);
+  // 按天升序输出最近 USAGE_DAYS_KEEP 天，缺的日子补 0（前端的柱状图要连续的横轴）
+  const days = [];
+  const now = Date.now();
+  for (let i = USAGE_DAYS_KEEP - 1; i >= 0; i--) {
+    const key = usageDayKey(now - i * 24 * 3600 * 1000);
+    const u = usageStats.byDay[key];
+    days.push({
+      day: key,
+      input: u ? u.input : 0,
+      output: u ? u.output : 0,
+      total: u ? u.total : 0,
+      calls: u ? u.calls : 0,
+    });
+  }
+  const topList = (obj, n) =>
+    Object.entries(obj)
+      .map(([name, u]) => ({ name, ...u }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, n);
+
+  return {
+    since: usageStats.since,
+    total: { ...t },
+    client_requests: usageStats.clientRequests,
+    // 重试放大倍数：上游调用数 ÷ 客户端请求数。1.0 表示每次请求都一次打中；
+    // 明显大于 1 说明有大量空响应重试/切号在偷偷烧额度 —— 这是用户选
+    // "按上游调用记"最想看到的那条信息，所以放后端算，避免两处公式漂移。
+    retry_amplification: usageStats.clientRequests
+      ? Number((t.calls / usageStats.clientRequests).toFixed(2))
+      : 0,
+    avg_per_call: t.calls ? Math.round(t.total / t.calls) : 0,
+    missing_rate: round1(t.calls + t.missing ? (t.missing / (t.calls + t.missing)) * 100 : 0),
+    by_model: topList(usageStats.byModel, 12),
+    by_account: topList(usageStats.byAccount, 12),
+    days,
+  };
 }
 
 // 账号管理动作。返回给前端的是**动作执行后的完整账号列表**，
@@ -713,11 +995,13 @@ function clineHeaders(sessionId, token) {
 async function clineFetch(env, path, bodyObj, sessionId, retried = false) {
   const token = await getAccessToken(env);
   const headers = clineHeaders(sessionId, token);
-  const resp = await fetch(CLINE_API_BASE + path, {
+  // 把此刻的账号钉在响应上：usage 要等流读完才拿得到，那时 currentAccount
+  // 可能已经被下一个请求改掉了，只有随响应携带的引用才准（见统计模块约束 2）
+  const resp = bindResponseAccount(await fetch(CLINE_API_BASE + path, {
     method: "POST",
     headers,
     body: JSON.stringify(bodyObj),
-  });
+  }));
   if (resp.status === 401 && !retried) {
     // token 失效：标记当前账号冷却，强制重试（会用别的账号/刷新）
     if (currentAccount) {
@@ -969,6 +1253,8 @@ async function handleChat(request, env) {
   if (!auth.ok) {
     return authError(auth.reason);
   }
+  // 鉴权通过后才计数：鉴权失败的请求不消耗上游额度，计进去会污染重试放大倍数
+  countClientRequest();
 
   let params;
   try {
@@ -1024,6 +1310,7 @@ async function handleChat(request, env) {
     // 非流式 + 非 deepseek：原逻辑
     const raw = await resp.json();
     const normalized = unwrapData(raw);
+    recordUsage(resp, normalized?.usage, { model: upstreamModel });
     normalized.model = model;
     return jsonResponse(normalized, 200);
   } catch (e) {
@@ -1050,15 +1337,24 @@ async function nonStreamWithContentCheck(env, path, bodyObj, sessionId, firstRes
     }
     const ct = resp.headers.get("content-type") || "";
     let normalized = null;
+    let rawUsage = null;
     if (ct.includes("text/event-stream")) {
-      normalized = await streamToNonStream(resp);
+      const agg = await streamToNonStream(resp);
+      normalized = agg.data;
+      rawUsage = agg.rawUsage;
     } else {
       const raw = await resp.json().catch(() => null);
-      if (raw) normalized = unwrapData(raw);
+      if (raw) {
+        normalized = unwrapData(raw);
+        rawUsage = normalized?.usage;
+      }
     }
     if (!normalized) {
       return { error: jsonResponse({ error: { message: "upstream returned non-SSE body", type: "api_error" } }, 502) };
     }
+    // 每轮都落账：这一轮真的打了一次上游，失败重试的那几次同样烧了 token。
+    // 放在 content 判定之前，才能把"空响应浪费掉的额度"也统计进去。
+    recordUsage(resp, rawUsage, { model: bodyObj?.model });
     lastData = normalized;
     const msg = normalized?.choices?.[0]?.message || {};
     const content = (msg.content || "").trim();
@@ -1138,19 +1434,23 @@ async function streamToNonStream(upstream) {
     msg.content = reasoning;
     msg.reasoning_used_as_content = true;
   }
+  // usage 一并带出去：调用方按"每次上游调用"落账（重试的那几次也各记一笔）
   return {
-    id: id || "gen_" + Date.now(),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: model || DEFAULT_MODEL,
-    choices: [{
-      index: 0,
-      message: msg,
-      finish_reason: finishReason || "stop",
-      logprobs: null,
-      native_finish_reason: finishReason || "stop",
-    }],
-    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    data: {
+      id: id || "gen_" + Date.now(),
+      object: "chat.completion",
+      created: Math.floor(Date.now() / 1000),
+      model: model || DEFAULT_MODEL,
+      choices: [{
+        index: 0,
+        message: msg,
+        finish_reason: finishReason || "stop",
+        logprobs: null,
+        native_finish_reason: finishReason || "stop",
+      }],
+      usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    },
+    rawUsage: usage,
   };
 }
 
@@ -1163,6 +1463,8 @@ async function handleAnthropic(request, env) {
   if (!auth.ok) {
     return authError(auth.reason);
   }
+  // 同 handleChat：鉴权通过后才计入客户端请求数
+  countClientRequest();
 
   let req;
   try {
@@ -1226,6 +1528,7 @@ async function handleAnthropic(request, env) {
     }
     const raw = await resp.json();
     const normalized = unwrapData(raw);
+    recordUsage(resp, normalized?.usage, { model: upstreamModel });
     // OpenAI → Anthropic
     return jsonResponse(openAItoAnthropic(normalized), 200);
   } catch (e) {
@@ -1255,6 +1558,7 @@ async function streamResponse(upstream, externalModel) {
   const encoder = new TextEncoder();
 
   let buf = "";
+  let rawUsage = null;   // 上游收尾 chunk 里的 usage，流读完后落账
   (async () => {
     try {
       while (true) {
@@ -1275,6 +1579,8 @@ async function streamResponse(upstream, externalModel) {
             try {
               const obj = JSON.parse(payload);
               const normalized = unwrapData(obj);
+              // 顺手捞 usage：这里已经 parse 过一次，不额外读流、不破坏流式透传
+              if (normalized?.usage) rawUsage = normalized.usage;
               if (normalized && externalModel) normalized.model = externalModel;
               await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
             } catch {
@@ -1288,6 +1594,8 @@ async function streamResponse(upstream, externalModel) {
     } catch (e) {
       // ignore
     } finally {
+      // 客户端提前断开也会走到这里：那时 rawUsage 为 null，记一笔 missing
+      recordUsage(upstream, rawUsage, { model: externalModel });
       try { await writer.close(); } catch {}
     }
   })();
@@ -1325,6 +1633,9 @@ async function streamResponseAnthropic(upstream, externalModel) {
   let toolBlockIndex = null;  // 当前工具块序号
   let stopReason = "end_turn";
   let outputTokens = 0;
+  let rawUsage = null;        // 完整 usage，流结束后用于落账
+  // 注：message_start 里的 input_tokens 恒为 0 —— 该事件必须先于内容发出，
+  //     而上游的 usage 只在收尾 chunk 才给，这是协议顺序决定的，无法提前得知。
 
   const ensureStarted = async () => {
     if (started) return;
@@ -1388,8 +1699,9 @@ async function streamResponseAnthropic(upstream, externalModel) {
               : choice.finish_reason === "length" ? "max_tokens"
               : "end_turn";
           }
-          if (normalized?.usage?.completion_tokens) {
-            outputTokens = normalized.usage.completion_tokens;
+          if (normalized?.usage) {
+            rawUsage = normalized.usage;
+            if (normalized.usage.completion_tokens) outputTokens = normalized.usage.completion_tokens;
           }
 
           if (delta.reasoning) {
@@ -1462,6 +1774,8 @@ async function streamResponseAnthropic(upstream, externalModel) {
       await send("message_stop", { type: "message_stop" });
     } catch (e) {
     } finally {
+      // 无论正常结束还是客户端提前断开都记一笔（断开时 rawUsage 为 null → missing）
+      recordUsage(upstream, rawUsage, { model: externalModel });
       try { await writer.close(); } catch {}
     }
   })();
@@ -2027,6 +2341,73 @@ ul.facts code{ font-size:11px; color:var(--accent); background:var(--accent-soft
 .stats .k{ font-size:10px; color:var(--ink-3); letter-spacing:.06em; text-transform:uppercase; margin-bottom:2px; }
 .stats .v{ font-size:15px; font-weight:700; font-variant-numeric:tabular-nums; }
 .stats .v.ok{ color:var(--ok); } .stats .v.cn{ color:var(--cn); }
+
+/* ── Token 统计页 ──────────────────────────────────────────────────────
+   沿用本控制台已有的仪表词汇（硬阴影、扫描线、tabular-nums），不另起一套。
+   唯一的"签名"是 .ratio 放大读数：它把"上游调用数 ÷ 客户端请求数"画成
+   一排方格，多出来的格子就是重试偷偷烧掉的份额 —— 这正是选择按上游调用
+   统计的意义所在，所以它占视觉重心，其余数字保持克制。 */
+.statgrid { display:grid; grid-template-columns:repeat(auto-fit,minmax(108px,1fr)); gap:2px; background:var(--line-soft); border:2px solid var(--line-soft); }
+.statgrid > div{ background:var(--surface); padding:10px 11px; }
+.statgrid .k{ font-size:10px; color:var(--ink-3); letter-spacing:.06em; text-transform:uppercase; margin-bottom:3px; }
+.statgrid .v{ font-size:18px; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+.statgrid .v.ok{ color:var(--ok); } .statgrid .v.warn{ color:var(--warn); }
+.statgrid .v.bad{ color:var(--bad); } .statgrid .v.dim{ color:var(--ink-3); }
+.statgrid .sub{ font-size:10px; color:var(--ink-3); margin-top:2px; font-variant-numeric:tabular-nums; }
+
+/* 放大读数：一排方格，前 ratio 个是"实际发出的上游调用" */
+.ratio{ display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+.ratio .num{ font-size:30px; font-weight:700; font-variant-numeric:tabular-nums; letter-spacing:-.03em; line-height:1; }
+.ratio .num.ok{ color:var(--ok); } .ratio .num.warn{ color:var(--warn); } .ratio .num.bad{ color:var(--bad); }
+.ratio .cells{ display:flex; gap:3px; flex-wrap:wrap; max-width:100%; }
+.ratio .cells i{
+  width:11px; height:20px; background:var(--accent); opacity:.28;
+  box-shadow:inset 0 0 0 1px var(--line);
+  /* 步进式"亮起"：与全站 steps() 动效语言一致，不用平滑缓动 */
+  animation:cell-in .28s steps(4) backwards;
+}
+.ratio .cells i.over{ background:var(--warn); opacity:1; }
+.ratio .cells i.over.bad{ background:var(--bad); }
+@keyframes cell-in{ from{ opacity:0; transform:scaleY(.35); } }
+.ratio .desc{ font-size:11.5px; color:var(--ink-2); max-width:46ch; }
+.ratio .desc b{ color:var(--ink); }
+
+/* 趋势柱：按天，纯 CSS 高度，缺的日子也要占位（横轴连续才有趋势可言） */
+.trend{ display:flex; align-items:flex-end; gap:2px; height:132px; padding:9px 10px 0; background:var(--bg); border:2px solid var(--line); overflow:hidden; }
+.trend .col{ flex:1; min-width:3px; display:flex; flex-direction:column; justify-content:flex-end; height:100%; position:relative; }
+.trend .col i{
+  display:block; background:var(--accent); opacity:.72; min-height:1px;
+  box-shadow:inset 0 0 0 1px var(--line-soft);
+  transition:height .45s steps(9), opacity .12s;
+  animation:bar-in .34s steps(5) backwards;
+}
+@keyframes bar-in{ from{ height:0 !important; opacity:0; } }
+/* 今天：唯一一个用实心强调的柱子，让"当前"一眼可见 */
+.trend .col.today i{ opacity:1; box-shadow:inset 0 0 0 1px var(--accent); }
+.trend .col:hover i{ opacity:1; }
+.trend .col .tip{
+  position:absolute; bottom:100%; left:50%; transform:translateX(-50%); margin-bottom:5px;
+  background:var(--raise); border:2px solid var(--line); box-shadow:var(--shadow-sm);
+  padding:5px 8px; font-size:10.5px; white-space:nowrap; opacity:0; pointer-events:none;
+  transition:opacity .12s; z-index:5; font-variant-numeric:tabular-nums;
+}
+.trend .col:hover .tip{ opacity:1; }
+.trend .col .tip b{ color:var(--accent); }
+.trend .col .tip .k{ color:var(--ink-3); }
+.trend-axis{ display:flex; gap:2px; padding:4px 10px 0; font-size:9.5px; color:var(--ink-3); }
+.trend-axis span{ flex:1; min-width:3px; text-align:center; overflow:hidden; white-space:nowrap; }
+/* 横轴标签太多会糊成一团：只在首/中/末三处显示，靠 JS 控制可见性 */
+.trend-axis span.hide{ visibility:hidden; }
+
+/* 排行表：模型 / 账号两个维度共用 */
+.rank{ width:100%; border-collapse:collapse; font-size:11.5px; }
+.rank th{ text-align:left; font-size:10px; color:var(--ink-3); letter-spacing:.05em; text-transform:uppercase; padding:0 8px 6px 0; font-weight:400; }
+.rank td{ padding:5px 8px 5px 0; border-top:1px solid var(--line-soft); vertical-align:middle; }
+.rank td.n{ text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.rank td.name{ max-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rank .mini{ display:block; height:5px; background:var(--accent); opacity:.55; margin-top:3px; min-width:2px; transition:width .45s steps(9); }
+.rank tr:hover .mini{ opacity:.9; }
+.rank .id{ font-family:var(--mono); font-size:10.5px; color:var(--ink-2); }
 .bar{ height:6px; background:var(--bg); border:2px solid var(--line); overflow:hidden; }
 .bar i{ display:block; height:100%; width:0; background-image:repeating-linear-gradient(90deg,var(--accent) 0 3px,transparent 3px 5px); }
 /* 模型表：固定高度的滚动窗口（白名单放行后仍有几十个模型，页面不能被撑长） */
@@ -2142,6 +2523,7 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
       <li><a data-v="chat" class="on"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 2.5h10v8H8l-3 3v-3H3z"/></svg>对话测试</a></li>
       <li><a data-v="accounts"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>账号<span class="cnt" id="cnt-acct"></span></a></li>
       <li><a data-v="models"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>模型<span class="cnt" id="cnt-model"></span></a></li>
+      <li><a data-v="usage"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 13.5h11"/><path d="M4.6 13.5V8.6M8 13.5V3.6M11.4 13.5V6.4"/></svg>统计<span class="cnt" id="cnt-usage"></span></a></li>
       <li><a data-v="logs"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>日志<span class="cnt" id="cnt-log"></span></a></li>
       <li><a data-v="config"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>接入配置</a></li>
     </ul>
@@ -2301,6 +2683,83 @@ table.m tr.cn td:first-child{ box-shadow:inset 3px 0 0 var(--cn); }
         </div>
       </section>
 
+      <!-- ── 统计：token 用量 ── -->
+      <section class="view" id="v-usage" hidden>
+        <!-- 签名读数：重试放大。放最上面是因为它回答的是"额度去哪了"，
+             而不是"用了多少" —— 后者看下面的总量就行。 -->
+        <div class="box">
+          <header>
+            <h3>重试放大</h3>
+            <span class="grow"></span>
+            <span class="note" id="uSince"></span>
+          </header>
+          <div class="pad">
+            <div class="ratio" id="uRatio"></div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header>
+            <h3>用量总览</h3>
+            <span class="grow"></span>
+            <span class="note">按上游调用计，含重试的那几次</span>
+          </header>
+          <div class="pad">
+            <div class="statgrid" id="uTotals"></div>
+            <div class="meter" id="uMeter" style="margin-top:12px"><i></i></div>
+            <div class="note" id="uMeterNote" style="margin-top:7px"></div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header>
+            <h3>近 30 天</h3>
+            <span class="grow"></span>
+            <span class="note">柱高 = 当日 token 合计</span>
+          </header>
+          <div class="pad">
+            <div class="trend" id="uTrend"></div>
+            <div class="trend-axis" id="uTrendAxis"></div>
+            <div class="empty" id="uTrendEmpty" hidden>还没有用量记录。发一条消息试试。</div>
+          </div>
+        </div>
+
+        <div class="grid2">
+          <div class="box">
+            <header><h3>按模型</h3><span class="grow"></span><span class="note" id="uModelNote"></span></header>
+            <div class="pad">
+              <table class="rank" id="uModelTbl">
+                <thead><tr><th>模型</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead>
+                <tbody id="uModelRows"></tbody>
+              </table>
+              <div class="empty" id="uModelEmpty" hidden>暂无数据。</div>
+            </div>
+          </div>
+          <div class="box">
+            <header><h3>按账号</h3><span class="grow"></span><span class="note" id="uAcctNote"></span></header>
+            <div class="pad">
+              <table class="rank" id="uAcctTbl">
+                <thead><tr><th>账号</th><th class="n">输入</th><th class="n">输出</th><th class="n">合计</th></tr></thead>
+                <tbody id="uAcctRows"></tbody>
+              </table>
+              <div class="empty" id="uAcctEmpty" hidden>暂无数据。</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>统计说明</h3></header>
+          <div class="pad">
+            <ul class="facts">
+              <li><b>按上游调用计，不按消息数计。</b>免费额度用尽时会自动切号重试，你发一条消息可能真的打了 2~3 次上游，这几次都实打实消耗额度，所以都记上。上方的「重试放大」就是两者之比。</li>
+              <li>客户端中途断开（点停止、关页面）时上游还没来得及回报用量，这类会计入<b>无用量回报</b>，不会用字符数瞎估——估算值混进来会让整份数字失去意义。</li>
+              <li id="uPersistNote">统计只存在<b>当前实例内存</b>里，进程重启会清零。</li>
+              <li>上游按自然日的免费额度结算，所以「近 30 天」用的是本机时区的自然日。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
       <!-- ── 日志：固定高度滚动窗口 ── -->
       <section class="view flush" id="v-logs" hidden>
         <div class="box" style="border:none;box-shadow:none;display:flex;flex-direction:column;height:100%;min-height:0">
@@ -2416,6 +2875,7 @@ var VIEWS = {
   chat:{t:"对话测试",s:"多轮对话自动带上下文"},
   accounts:{t:"账号",s:"账号池状态与登录"},
   models:{t:"模型",s:"浏览模型，测延迟与输出速度"},
+  usage:{t:"统计",s:"token 用量与重试放大"},
   logs:{t:"日志",s:"固定窗口滚动查看历史请求"},
   config:{t:"接入配置",s:"把服务接到你的客户端"}
 };
@@ -2744,6 +3204,7 @@ function showTab(name){
   if(name==="config") renderSnip();
   if(name==="logs") renderLogs();
   if(name==="accounts") renderAccts();
+  if(name==="usage") renderUsage();
 }
 
 /* ══ 健康 / 账号池 ══ */
@@ -2774,6 +3235,9 @@ function renderHealth(h){
   $("poolV").textContent=avail+" / "+total;
   $("poolV").className="v "+cls;
   $("cnt-acct").textContent=total?String(total):"";
+
+  // 统计页若正在显示，跟着这次健康检查一起刷新（否则要切页才更新）
+  if(!$("v-usage").hidden) renderUsage();
 
   var ok=h.api_key_configured;
   $("keySq").className="sq "+(ok?"ok":"bad");
@@ -2931,6 +3395,9 @@ function acctCard(a){
   var rateCls = !total ? "dim" : (total && (s.ok||0)/total>=0.8 ? "ok" : ((s.ok||0)/total>=0.5?"warn":"bad"));
 
   var email = a.email || ("账号 #"+(a.index+1));
+  // token 用量：按上游调用计，与统计页口径一致
+  var us = a.usage || {};
+  var usCls = us.total ? "" : "dim";
   var lastRow = s.last_error
     ? '<div class="last" title="'+esc(s.last_error+(s.last_error_at?"（"+fmtAgo(s.last_error_at)+"）":""))+'">'+
         '<span class="k">最后错误</span>'+esc(s.last_error)+'</div>'
@@ -2955,6 +3422,8 @@ function acctCard(a){
       '<div><span class="k">token 缓存</span><span class="v'+(a.token_cached?" ok":" dim")+'">'+(a.token_cached?"有":"无")+'</span></div>'+
       '<div><span class="k">成功 / 失败</span><span class="v"><span class="ok">'+(s.ok||0)+'</span> / <span class="'+(s.fail?"bad":"dim")+'">'+(s.fail||0)+'</span></span></div>'+
       '<div><span class="k">成功率</span><span class="v '+rateCls+'">'+rateV+'</span></div>'+
+      '<div title="该账号消耗的输入 token（按上游调用累计）"><span class="k">输入 token</span><span class="v '+usCls+'">'+fmtTok(us.input)+'</span></div>'+
+      '<div title="该账号消耗的输出 token（按上游调用累计）"><span class="k">输出 token</span><span class="v '+usCls+'">'+fmtTok(us.output)+'</span></div>'+
       '<div><span class="k">最后使用</span><span class="v '+(s.last_used_at?"":"dim")+'">'+esc(s.last_used_at?fmtAgo(s.last_used_at):"—")+'</span></div>'+
       '<div><span class="k">账号 ID</span><span class="v dim" title="'+esc(a.id)+'">'+esc(a.id.slice(0,6))+'</span></div>'+
     '</div>'+
@@ -3274,6 +3743,183 @@ function renderMStats(){
   ].concat(paid>0?[cell("非免费（回退列表）",String(paid),"")]:[]).join("");
 }
 function cell(k,v,cls){ return '<div><div class="k">'+esc(k)+'</div><div class="v '+(cls||"")+'">'+esc(v)+"</div></div>"; }
+
+/* ══ Token 统计 ══
+   注意：本文件会被 build-console.mjs 注入 worker.js 的模板字符串，
+   反引号与 \${ 会被转义成字面量而失效 —— 只能用字符串拼接，不要用模板字符串。 */
+
+// token 数动辄上万，直接显示会撑爆数据格；按量级压缩，保留有效位数
+function fmtTok(n){
+  n=Number(n)||0;
+  if(!isFinite(n)) return "-";
+  var a=Math.abs(n);
+  if(a<1000) return String(Math.round(n));
+  if(a<1e6) return (n/1000).toFixed(a<1e4?1:0)+"K";
+  if(a<1e9) return (n/1e6).toFixed(a<1e7?2:1)+"M";
+  return (n/1e9).toFixed(2)+"B";
+}
+
+// 只显示首/中/末三个横轴标签：30 个日期全放会糊成一团，还不如给最小的定位锚点
+function trendLabelHide(i,total){
+  return !(i===0||i===total-1||i===Math.floor(total/2));
+}
+
+function renderUsage(){
+  var h=state.health||{};
+  var u=h.usage;
+  if(!u){
+    $("uSince").textContent="";
+    $("uRatio").innerHTML='<span class="desc">后台还没有返回统计数据。确认服务是最新版（<b>v2.3.0</b> 以上）。</span>';
+    $("uTotals").innerHTML="";
+    $("uMeter").innerHTML="<i></i>";
+    $("uMeterNote").textContent="";
+    $("uTrend").innerHTML=""; $("uTrendAxis").innerHTML="";
+    $("uModelRows").innerHTML=""; $("uAcctRows").innerHTML="";
+    return;
+  }
+
+  var t=u.total||{};
+  var calls=t.calls||0, reqs=u.client_requests||0;
+
+  $("uSince").textContent = u.since ? ("统计自 "+fmtClock(u.since)+" · "+fmtAgo(u.since)) : "";
+
+  /* ── 签名读数：重试放大 ──
+     calls ÷ reqs。1.0 表示每次消息都一次打中；大于 1 说明有空响应重试/切号
+     在偷偷烧额度 —— 这正是"按上游调用统计"要暴露的那条信息。
+
+     ⚠️ 三种"不等于 1"的情况含义完全不同，不能共用一句话糊过去，否则就是假话：
+       calls > reqs  重试放大（有额度被重试烧掉）
+       calls < reqs  有请求压根没打到上游（账号池不可用 / 全部冷却）
+       calls = 0     一次上游都没打通，此时说"没有多余开销"是错的 */
+  var amp=Number(u.retry_amplification)||0;
+  var extra=Math.max(calls-reqs,0);
+  var missed=Math.max(reqs-calls,0);
+  var ampCls, verdict;
+  if(!reqs){
+    ampCls="dim";
+    verdict="还没有请求。发一条消息后这里会显示上游调用与客户端请求的比例。";
+  }else if(!calls){
+    ampCls="bad";
+    verdict="这 <b>"+reqs+"</b> 条请求都没打到上游（账号池不可用或额度冷却中），所以没有消耗 token。";
+  }else if(amp>1.02){
+    ampCls = amp<1.5 ? "warn" : "bad";
+    verdict="<b>"+extra+"</b> 次是重试烧掉的 —— 客户端只发了 "+reqs+" 条消息，上游却实打实跑了 "+calls+" 次。";
+  }else if(missed>0){
+    ampCls="warn";
+    verdict="有 <b>"+missed+"</b> 条请求没打到上游（账号池不可用或额度冷却），其余都一次打中。";
+  }else{
+    ampCls="ok";
+    verdict="每次请求都一次打中，没有多余开销。";
+  }
+  // 没有上游调用时，0.00× 会让人误以为"零开销"，显示 — 更诚实
+  var ampTxt = calls ? amp.toFixed(2)+"×" : "—";
+
+  // 方格：每次上游调用一格。过多时按比例缩放，并在文案里给出精确数字，
+  // 所以缩放不会让人误读（数字永远比图形优先）。
+  var MAXCELL=40, shown=Math.min(calls,MAXCELL);
+  var useCells=calls?Math.round(shown*(reqs/calls)):0;
+  if(useCells>shown) useCells=shown;
+  var cellsHtml="";
+  for(var i=0;i<shown;i++){
+    var extraCell=i>=useCells;
+    cellsHtml+='<i class="'+(extraCell?("over "+ampCls):"")+'" style="animation-delay:'+(i*9)+'ms"></i>';
+  }
+  var cellsWrap = calls
+    ? '<span class="cells">'+cellsHtml+'</span>'
+    : "";
+  var scaleNote = calls>MAXCELL ? '（方格为等比示意，'+calls+' 格已缩放到 '+MAXCELL+' 格）' : "";
+
+  $("uRatio").innerHTML=
+    '<span class="num '+ampCls+'">'+ampTxt+'</span>'+
+    cellsWrap+
+    '<span class="desc">'+verdict+' '+scaleNote+'</span>';
+
+  /* ── 总览 ── */
+  var miss=(t.missing||0);
+  $("uTotals").innerHTML=[
+    cell("输入 token",fmtTok(t.input),"ok"),
+    cell("输出 token",fmtTok(t.output),"cn"),
+    cell("合计 token",fmtTok(t.total)),
+    cell("上游调用",String(calls)),
+    cell("客户端请求",String(reqs)),
+    cell("平均每次",calls?fmtTok(u.avg_per_call):"—",calls?"":"dim"),
+    cell("无用量回报",String(miss),miss?"warn":"dim")
+  ].join("");
+
+  /* ── 思考 token 占比：推理模型下这块经常占掉输出的大头，值得单列 ── */
+  var rea=t.reasoning||0, out=t.output||0;
+  if(out>0&&rea>0){
+    var pct=Math.min(100,Math.round(rea/out*100));
+    $("uMeter").innerHTML='<i style="width:'+pct+'%"></i>';
+    $("uMeterNote").innerHTML='思考 token <b>'+fmtTok(rea)+'</b>，占输出 '+pct+'%（上游按输出计费时这块也算钱）';
+  } else {
+    $("uMeter").innerHTML='<i style="width:0"></i>';
+    $("uMeterNote").textContent = out>0 ? "上游未回报思考 token 明细。" : "";
+  }
+
+  /* ── 近 30 天趋势 ── */
+  var days=u.days||[];
+  var max=0;
+  for(var d=0;d<days.length;d++) if((days[d].total||0)>max) max=days[d].total||0;
+  if(!max){
+    $("uTrend").innerHTML=""; $("uTrendAxis").innerHTML="";
+    $("uTrendEmpty").hidden=false;
+  } else {
+    $("uTrendEmpty").hidden=true;
+    var todayKey=days.length?days[days.length-1].day:"";
+    var bars="",axis="";
+    for(var k2=0;k2<days.length;k2++){
+      var dd=days[k2];
+      var pctH=Math.max(Math.round((dd.total||0)/max*100),dd.total?2:1);
+      var tip='<span class="tip"><b>'+esc(dd.day)+'</b><br><span class="k">合计</span> '+fmtTok(dd.total)+
+              '<br><span class="k">入/出</span> '+fmtTok(dd.input)+" / "+fmtTok(dd.output)+
+              '<br><span class="k">调用</span> '+dd.calls+'</span>';
+      bars+='<div class="col'+(dd.day===todayKey?" today":"")+'">'+tip+
+            '<i style="height:'+pctH+'%;animation-delay:'+(k2*11)+'ms"></i></div>';
+      // 轴标签只留首/中/末，其余占位不显示（保持列宽对齐）
+      var lbl=dd.day.slice(5);
+      axis+='<span'+(trendLabelHide(k2,days.length)?' class="hide"':"")+'>'+esc(lbl)+"</span>";
+    }
+    $("uTrend").innerHTML=bars;
+    $("uTrendAxis").innerHTML=axis;
+  }
+
+  /* ── 排行：模型 / 账号 ── */
+  function rankRows(list,labelFn,emptyId,tblId){
+    var tb=$(tblId);
+    if(!list||!list.length){ tb.innerHTML=""; $(emptyId).hidden=false; return; }
+    $(emptyId).hidden=true;
+    var top=list[0].total||1;
+    tb.innerHTML=list.map(function(r){
+      var w=Math.max(Math.round((r.total||0)/top*100),1);
+      return "<tr>"+
+        '<td class="name" title="'+esc(r.name)+'">'+labelFn(r)+
+          '<span class="mini" style="width:'+w+'%"></span></td>'+
+        '<td class="n">'+fmtTok(r.input)+"</td>"+
+        '<td class="n">'+fmtTok(r.output)+"</td>"+
+        '<td class="n"><b>'+fmtTok(r.total)+"</b></td>"+
+      "</tr>";
+    }).join("");
+  }
+  // 模型名可能很长（如 cline-free/deepseek-v4.1-flash），截断显示、title 给全名
+  rankRows(u.by_model,function(r){
+    var s=String(r.name||""), short=s.length>30?s.slice(0,29)+"…":s;
+    return esc(short);
+  },"uModelEmpty","uModelRows");
+  // 账号：列表里存的是 id 短哈希，配上邮箱更好认；邮箱从 account_details 取
+  var acctMap={};
+  ((h.account_details)||[]).forEach(function(a){ acctMap[a.id]=a.email||("账号 #"+(a.index+1)); });
+  rankRows(u.by_account,function(r){
+    var nm=acctMap[r.name]||("ID "+String(r.name).slice(0,6));
+    return esc(nm)+' <span class="id">'+esc(String(r.name).slice(0,6))+"</span>";
+  },"uAcctEmpty","uAcctRows");
+
+  $("uModelNote").textContent=(u.by_model||[]).length>12?"仅列前 12 项":"";
+  $("uAcctNote").textContent=(u.by_account||[]).length>12?"仅列前 12 项":"";
+
+  // 侧栏角标：总量压缩显示，瞥一眼就知道用量级别
+  $("cnt-usage").textContent=t.total?fmtTok(t.total):"";
+}
 
 function testModel(id){
   var m=null;

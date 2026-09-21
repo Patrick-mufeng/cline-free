@@ -113,6 +113,58 @@ console.log(`  POST http://localhost:${PORT}/v1/messages      (Anthropic 格式)
 console.log("=".repeat(64));
 
 /**
+ * Token 统计的本地持久化。
+ *
+ * worker.js 本身不碰文件系统（Cloudflare / Vercel 上没有可写磁盘，强上 KV/D1 会
+ * 破坏"单文件复制粘贴即可部署"的定位），它只暴露 globalThis.__clineUsage 这几个
+ * 钩子；由本地服务负责落盘，重启后统计不丢。
+ *
+ * 放在 USERPROFILE / HOME 而不是项目目录，是为了避免误提交 —— 虽然 .gitignore 里
+ * 的 *.local 已经能挡住，但多一层保险不亏。文件很小（几十 KB 上限）。
+ */
+const USAGE_FILE = join(
+  process.env.USERPROFILE || process.env.HOME || __dirname,
+  ".cline-free-usage.local.json"
+);
+
+function loadUsageSnapshot() {
+  try {
+    if (!existsSync(USAGE_FILE)) return null;
+    const txt = readFileSync(USAGE_FILE, "utf8");
+    const obj = JSON.parse(txt);
+    return obj && typeof obj === "object" ? obj : null;
+  } catch (e) {
+    console.error("[usage] 读取统计文件失败，从零开始：", String(e.message || e).slice(0, 120));
+    return null;
+  }
+}
+
+function saveUsageSnapshot(snap) {
+  try {
+    writeFileSync(USAGE_FILE, JSON.stringify(snap), "utf8");
+  } catch (e) {
+    console.error("[usage] 写入统计文件失败：", String(e.message || e).slice(0, 120));
+  }
+}
+
+/** 把持久化钩子接到当前 worker 模块上，并装回上次的统计。
+ *  ⚠️ 顺序很关键：worker.js 在模块顶层会重设 globalThis.__clineUsage，所以
+ *  新版一导入，全局引用就指向新实例了。旧实例的计数必须先冲刷出去，
+ *  否则热重载会把上次写盘之后的增量悄悄丢掉。
+ *  也因此这里不用 globalThis 上的引用去冲旧实例，而是调用方传来的 prevApi。 */
+function attachUsagePersistence(prevApi) {
+  const api = globalThis.__clineUsage;
+  if (!api) return false;
+  if (prevApi && prevApi !== api) {
+    try { prevApi.flushUsageNow(); } catch (e) {}
+  }
+  api.setUsagePersistence(saveUsageSnapshot);
+  const snap = loadUsageSnapshot();
+  if (snap) api.restoreUsage(snap);
+  return true;
+}
+
+/**
  * 加载 worker.js，并在文件变化时自动重新加载。
  * 背景：Node 会缓存 ESM 导入，改完 worker.js（尤其是跑过 build-console.mjs
  * 重新生成内联 HTML 之后）如果只重启不够或忘了重启，服务会继续返回旧页面，
@@ -127,11 +179,14 @@ async function getWorker() {
   try {
     const mtime = statSync(workerPath).mtimeMs;
     if (!worker || mtime !== workerMtime) {
+      // 先记下旧实例的统计句柄：新模块顶层会把 globalThis.__clineUsage 覆盖掉
+      const prevApi = globalThis.__clineUsage;
       // 用 query 参数绕开 ESM 模块缓存
       const mod = await import("./worker.js?t=" + mtime);
       worker = mod.default;
       workerMtime = mtime;
       reloads++;
+      attachUsagePersistence(prevApi);
       if (reloads > 1) console.log(`[hot-reload] worker.js 已更新，已重新加载（第 ${reloads - 1} 次）`);
     }
   } catch (e) {
@@ -198,5 +253,28 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`\n✅ 服务已启动，按 Ctrl+C 停止\n`);
+  // 启动时就把 worker 载进来：一是让统计文件立刻被读取（控制台首屏就有数），
+  // 二是提前暴露语法错误，而不是等到第一个请求才报
+  getWorker().then(() => {
+    console.log(`\n✅ 服务已启动，按 Ctrl+C 停止\n`);
+  }).catch((e) => {
+    console.error("\n❌ worker.js 加载失败：", String(e.message || e));
+    console.error("   修好后再访问页面；本进程会继续监听，改动会自动重载。\n");
+  });
 });
+
+// 退出前把统计冲刷到磁盘：落盘是防抖的（默认 1.5s），
+// 否则 Ctrl+C 会丢掉最后一两秒的增量
+let usageFlushed = false;
+function flushOnExit() {
+  if (usageFlushed) return;
+  usageFlushed = true;
+  try { globalThis.__clineUsage?.flushUsageNow(); } catch (e) {}
+}
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    flushOnExit();
+    process.exit(0);
+  });
+}
+process.on("exit", flushOnExit);

@@ -93,6 +93,29 @@ const upstream = createServer(async (req, res) => {
     return;
   }
 
+  // 「200 但 content 全空、只有 reasoning」—— 免费通道的典型坏响应，
+  // 会触发 nonStreamWithContentCheck 的切号重试。不带延迟，让重试用例跑得快。
+  if (mode.kind === "empty") {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write("data: " + JSON.stringify({
+      data: {
+        id: "gen_empty",
+        model: "cline-free/deepseek-v4.1-flash",
+        choices: [{ index: 0, delta: { reasoning: "思考中…" }, finish_reason: null }],
+      },
+    }) + "\n\n");
+    res.write("data: " + JSON.stringify({
+      data: {
+        id: "gen_empty",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        usage: { prompt_tokens: 7, completion_tokens: 3 },
+      },
+    }) + "\n\n");
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
   // 正常：模拟流式，分块输出，每块之间有明显延迟
   res.writeHead(200, { "Content-Type": "text/event-stream" });
   const parts = ["你", "好", "，", "世", "界"];
@@ -750,6 +773,168 @@ console.log("\n【14】账号控制（启用/停用/重置冷却/移除）");
   check("账号 id 在 token 轮换后保持稳定",
     afterRefresh.account_details[0].id === idA,
     "before=" + idA + " after=" + afterRefresh.account_details[0].id);
+}
+
+// =====================================================================
+console.log("\n【15】Token 用量统计");
+{
+  // 独立实例：统计是模块级累计状态，混进前面的用例会互相污染
+  const { readFileSync, writeFileSync, mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const src = readFileSync(new URL("./worker.js", import.meta.url), "utf8")
+    .replace('const CLINE_API_BASE = "https://api.cline.bot/api/v1";', 'const CLINE_API_BASE = "' + UPSTREAM + '/api/v1";');
+  const dir = mkdtempSync(join(tmpdir(), "usage-test-"));
+  const f = join(dir, "w.mjs");
+  writeFileSync(f, src, "utf8");
+  const w = (await import("file:///" + f.split("\\").join("/"))).default;
+
+  const env = { API_KEY: "sk-test", CLINE_REFRESH_TOKEN: "TOKEN_A_aaaaaaaaaa\nTOKEN_B_bbbbbbbbbb" };
+  const health = async () => (await w.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  const chat = (body) => w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
+    body: JSON.stringify(body || { model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+  // Anthropic 协议走同一条上游，用于验证另一条返回路径也落了账
+  const anth = () => w.fetch(new Request("https://x.dev/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test", "x-api-key": "sk-test" },
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+
+  setMode({ kind: "ok" });
+  let h = await health();
+  check("health 含 usage 汇总", h.usage && typeof h.usage === "object",
+    JSON.stringify(h.usage || null).slice(0, 160));
+  check("usage.total 各字段初始为 0",
+    h.usage.total.input === 0 && h.usage.total.output === 0 && h.usage.total.calls === 0,
+    JSON.stringify(h.usage.total));
+  check("usage.days 已铺满 30 天（横轴连续）", h.usage.days.length === 30,
+    "days=" + h.usage.days.length);
+  check("账号明细含 usage 字段",
+    h.account_details.every((a) => a.usage && typeof a.usage.total === "number"));
+
+  // ── 流式：usage 从收尾 chunk 里取（假上游给的是 5 prompt / 5 completion）──
+  const beforeCalls = (await health()).usage.total.calls;
+  const streamResp = await chat();
+  await streamResp.text(); // 必须读完流，worker 才会在 finally 里落账
+  h = await health();
+  check("流式请求后上游调用数 +1", h.usage.total.calls === beforeCalls + 1,
+    "calls=" + h.usage.total.calls);
+  check("流式 usage 被记录（input=5 / output=5）",
+    h.usage.total.input === 5 && h.usage.total.output === 5,
+    JSON.stringify(h.usage.total));
+  check("流式 usage 的合计 = 输入 + 输出", h.usage.total.total === 10,
+    JSON.stringify(h.usage.total));
+  check("客户端请求数被记录", h.usage.client_requests === 1,
+    "client_requests=" + h.usage.client_requests);
+  check("一次打中时放大倍数为 1.0", h.usage.retry_amplification === 1,
+    "amp=" + h.usage.retry_amplification);
+  check("usage 按模型分组", (h.usage.by_model || []).some((m) => m.total === 10),
+    JSON.stringify(h.usage.by_model));
+  check("usage 按账号分组", (h.usage.by_account || []).length === 1,
+    JSON.stringify(h.usage.by_account));
+  check("账号卡上的 token 数跟着累加",
+    h.account_details.some((a) => a.usage.input === 5 && a.usage.output === 5),
+    JSON.stringify(h.account_details.map((a) => a.usage)));
+  check("今日用量进入 days 的最后一格",
+    h.usage.days[29].total === 10 && h.usage.days[29].calls === 1,
+    JSON.stringify(h.usage.days[29]));
+
+  // ── 重试放大：这是"按上游调用统计"要暴露的核心信息 ──
+  // 空响应会让 worker 切号重试，每次重试都真实消耗上游额度。
+  // 客户端只发 1 条消息，但上游被打了 3 次（首轮 + 2 次重试用尽）。
+  setMode({ kind: "empty" });
+  const before2 = (await health()).usage;
+  const emptyResp = await chat({ model: "deepseek/deepseek-v4-flash", stream: false, messages: [{ role: "user", content: "hi" }] });
+  await emptyResp.text();
+  h = await health();
+  const dCalls = h.usage.total.calls - before2.total.calls;
+  const dReq = h.usage.client_requests - before2.client_requests;
+  check("空响应重试：客户端只发 1 次", dReq === 1, "dReq=" + dReq);
+  check("空响应重试：上游被调用多次（重试都记上）", dCalls > 1,
+    "dCalls=" + dCalls + "（应 >1，体现重试烧掉的额度）");
+  check("重试的那几次也计入了 token", h.usage.total.input > before2.total.input,
+    "input " + before2.total.input + " → " + h.usage.total.input);
+  check("放大倍数随之 >1（暴露重试开销）", h.usage.retry_amplification > 1,
+    "amp=" + h.usage.retry_amplification);
+
+  // ── Anthropic 协议路径也要落账 ──
+  // 先清掉上一段重试测试留下的账号冷却：两个号都在冷却时请求会直接被拒
+  // （all_accounts_cooling），压根到不了上游，那样测的就不是 Anthropic 路径了。
+  await w.fetch(new Request("https://x.dev/v1/accounts/action", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
+    body: JSON.stringify({ action: "resetAll" }),
+  }), env);
+
+  setMode({ kind: "ok" });
+  const before3 = (await health()).usage;
+  const aResp = await anth();
+  await aResp.text();
+  h = await health();
+  check("Anthropic 非流式路径也记录用量",
+    h.usage.total.calls > before3.total.calls && h.usage.total.output > before3.total.output,
+    "calls " + before3.total.calls + " → " + h.usage.total.calls + "，status=" + aResp.status);
+
+  // ── Anthropic 流式路径 ──
+  const before4 = (await health()).usage;
+  const aStream = await w.fetch(new Request("https://x.dev/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: "Bearer sk-test" },
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }), env);
+  await aStream.text();
+  h = await health();
+  check("Anthropic 流式路径也记录用量", h.usage.total.calls > before4.total.calls,
+    "calls " + before4.total.calls + " → " + h.usage.total.calls);
+
+  // ── 鉴权失败不计入客户端请求数：没消耗上游额度，计进去会污染放大倍数 ──
+  const before5 = (await health()).usage.client_requests;
+  await w.fetch(new Request("https://x.dev/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer WRONG" },
+    body: JSON.stringify({ model: "cline-free/deepseek-v4.1-flash", messages: [{ name: "x" }] }),
+  }), env);
+  h = await health();
+  check("鉴权失败不计入客户端请求数", h.usage.client_requests === before5,
+    before5 + " → " + h.usage.client_requests);
+
+  // ── 持久化钩子：本地 local-server 靠它跨重启保留统计 ──
+  const api = globalThis.__clineUsage;
+  check("worker 暴露持久化钩子（__clineUsage）",
+    api && typeof api.setUsagePersistence === "function" &&
+    typeof api.restoreUsage === "function" && typeof api.exportUsage === "function");
+  // 落盘是防抖的（1.5s），这里用 flushUsageNow 同步取一次，否则拿到的是 null
+  let flushed = null;
+  api.setUsagePersistence((snap) => { flushed = snap; });
+  api.flushUsageNow();
+  check("导出快照含统计结构",
+    flushed && flushed.total && flushed.byDay && flushed.byAccount,
+    JSON.stringify(flushed && Object.keys(flushed)).slice(0, 160));
+  const snapTotal = flushed.total.total;
+  check("快照里的合计量 >0", snapTotal > 0, "total=" + snapTotal);
+  check("快照含按账户分组的用量", Object.keys(flushed.byAccount).length > 0,
+    JSON.stringify(Object.keys(flushed.byAccount)));
+
+  // 恢复：把快照灌回另一个实例，验证累加语义（重启后统计不丢）
+  const dir2 = mkdtempSync(join(tmpdir(), "usage-test2-"));
+  const f2 = join(dir2, "w2.mjs");
+  writeFileSync(f2, src, "utf8");
+  const w2 = (await import("file:///" + f2.split("\\").join("/"))).default;
+  const api2 = globalThis.__clineUsage;
+  const okRestore = api2.restoreUsage(flushed);
+  const h2 = await (await w2.fetch(new Request("https://x.dev/v1/health"), env)).json();
+  check("快照可恢复到新实例（跨重启保留）",
+    okRestore === true && h2.usage.total.total === snapTotal && h2.usage.client_requests === flushed.clientRequests,
+    "期望 total=" + snapTotal + "，实际 " + h2.usage.total.total +
+    "；clientRequests 期望 " + flushed.clientRequests + "，实际 " + h2.usage.client_requests);
+  check("恢复后账号卡上的 token 数不归零",
+    h2.account_details.some((a) => a.usage.total > 0),
+    JSON.stringify(h2.account_details.map((a) => a.usage)));
+  check("恢复后重试放大倍数一致",
+    Math.abs(h2.usage.retry_amplification - (flushed.total.calls / flushed.clientRequests)) < 0.02,
+    "amp=" + h2.usage.retry_amplification);
 }
 
 // ---------- 收尾 ----------
